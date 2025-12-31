@@ -1,0 +1,9 @@
+pandas
+akshare
+numpy
+pyecharts
+langgraph
+langchain_core
+openai
+curl_cffi
+python-dotenv
