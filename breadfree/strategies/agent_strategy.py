@@ -6,8 +6,11 @@ import pandas as pd
 from typing import TypedDict, Annotated, List, Dict, Any
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage
-from .base_strategy import Strategy
-from ..utils.llm_client import async_hunyuan_chat, logger
+from .base_strategy import BreadFreeStrategy
+from ..utils.llm_client import async_hunyuan_chat
+from ..utils.logger import get_logger
+
+logger = get_logger(__name__, mode="all")
 
 # --- State Definition ---
 class AgentState(TypedDict):
@@ -132,16 +135,19 @@ def build_graph():
     return workflow.compile()
 
 # --- Strategy Implementation ---
-class AgentStrategy(Strategy):
+class AgentStrategy(BreadFreeStrategy):
     def __init__(self, broker, lot_size=100):
         super().__init__(broker, lot_size)
         self.app = build_graph()
         self.symbol = None
-        self.history = [] # Keep track of close prices for indicators
         self.news_data = [] # Store loaded news
 
-    def set_symbol(self, symbol):
-        self.symbol = symbol
+    def set_symbols(self, symbols):
+        if len(symbols) > 1:
+            print("Warning: AgentStrategy currently supports analysis for only one symbol. Using the first one.")
+        self.symbol = symbols[0]
+        # 调用基类初始化 history 字典
+        super().set_symbols(symbols)
         self.load_news()
 
     def load_news(self):
@@ -189,15 +195,16 @@ class AgentStrategy(Strategy):
             print(f"Error filtering news: {e}")
             return "新闻数据处理出错"
 
-    def preload_history(self, history_df):
-        """Preload history data for indicators calculation"""
-        if not history_df.empty:
-            self.history = history_df['close'].tolist()
-            print(f"Preloaded {len(self.history)} days of history.")
+    def on_bar(self, date, bars):
+        if self.symbol not in bars:
+            return
+        bar_data = bars[self.symbol]
 
-    def on_bar(self, date, bar_data):
         # Update history
-        self.history.append(bar_data['close'])
+        if self.symbol not in self.history:
+            self.history[self.symbol] = []
+        
+        self.history[self.symbol].append(bar_data['close'])
         
         # Run async graph in sync context
         try:
@@ -208,17 +215,18 @@ class AgentStrategy(Strategy):
     async def _run_graph(self, date, bar_data):
         # 1. Prepare Data
         # Calculate Indicators
-        ma5 = pd.Series(self.history).rolling(window=5).mean().iloc[-1] if len(self.history) >= 5 else bar_data['close']
-        ma20 = pd.Series(self.history).rolling(window=20).mean().iloc[-1] if len(self.history) >= 20 else bar_data['close']
+        hist = self.history[self.symbol]
+        ma5 = pd.Series(hist).rolling(window=5).mean().iloc[-1] if len(hist) >= 5 else bar_data['close']
+        ma20 = pd.Series(hist).rolling(window=20).mean().iloc[-1] if len(hist) >= 20 else bar_data['close']
         
         # Calculate Volatility (Standard Deviation of last 30 days returns)
         volatility = 0.0
-        if len(self.history) >= 30:
-            returns = pd.Series(self.history).pct_change().dropna()
+        if len(hist) >= 30:
+            returns = pd.Series(hist).pct_change().dropna()
             volatility = returns.tail(30).std() * 100 # Percentage
 
         # Get recent price history (last 5 days)
-        recent_prices = self.history[-5:] if len(self.history) >= 5 else self.history
+        recent_prices = hist[-5:] if len(hist) >= 5 else hist
         recent_prices_str = ", ".join([f"{p:.2f}" for p in recent_prices])
 
         # Get Real News Context

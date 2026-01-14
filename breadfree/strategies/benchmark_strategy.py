@@ -1,6 +1,6 @@
-from .base_strategy import Strategy
+from .base_strategy import BreadFreeStrategy
 
-class BenchmarkStrategy(Strategy):
+class BenchmarkStrategy(BreadFreeStrategy):
     """
     Market Benchmark Strategy (Buy and Hold)
     Simply buys the asset on the first available opportunity and holds it until the end.
@@ -8,32 +8,41 @@ class BenchmarkStrategy(Strategy):
     """
     def __init__(self, broker, lot_size=100):
         super().__init__(broker, lot_size)
-        self.symbol = None
-        self.invested = False
+        self.invested = {} # {symbol: bool}
 
-    def set_symbol(self, symbol):
-        self.symbol = symbol
+    def set_symbols(self, symbols):
+        super().set_symbols(symbols)
+        self.invested = {s: False for s in symbols}
 
-    def on_bar(self, date, bar_data):
-        # If already invested, do nothing (Hold)
-        if self.invested:
-            return
-
-        # Buy on the first day (or first opportunity)
-        close_price = bar_data['close']
+    def on_bar(self, date, bars):
+        # Buy on the first day available for each symbol
         available_cash = self.broker.cash
+        # Strategy: Buy everything on start, equal weighting?
+        # Or Just fill up.
+        # For simple benchmarking, we just try to buy 'target allocation' for each symbol once.
         
-        # Calculate max quantity
-        # Estimate cost including commission (approximate)
-        # We leave a small buffer for commission to avoid rejection
-        max_shares = int(available_cash / (close_price * (1 + self.broker.commission_rate)))
-        
-        # Round down to nearest lot_size
-        quantity = (max_shares // self.lot_size) * self.lot_size
-        
-        if quantity > 0:
-            print(f"[{date}] Benchmark Buy: Buying {quantity} shares of {self.symbol} at {close_price:.2f}")
-            self.broker.buy(date, self.symbol, close_price, quantity)
-            self.invested = True
-        else:
-            print(f"[{date}] Insufficient cash to buy benchmark position. Cash: {available_cash:.2f}, Price: {close_price:.2f}")
+        target_per_symbol = self.broker.initial_cash / len(self.symbols)
+
+        for symbol, bar_data in bars.items():
+            if self.invested.get(symbol, False):
+                continue
+
+            close_price = bar_data['close']
+            
+            # Simple check if we have enough cash (ignoring that other symbols might need cash too)
+            # In a real portfolio construction we would allocate strictly. 
+            # Here: Try to buy 1/N value.
+            
+            # Estimate max shares for this chunk
+            max_shares = int(target_per_symbol / (close_price * (1 + self.broker.commission_rate)))
+            quantity = (max_shares // self.lot_size) * self.lot_size
+            
+            if quantity > 0:
+                 # Check actual cash availability (since other buys might have drained it if logic is loose)
+                 cost = quantity * close_price * (1 + self.broker.commission_rate)
+                 if self.broker.cash >= cost:
+                      print(f"[{date}] Benchmark Buy: Buying {quantity} shares of {symbol} at {close_price:.2f}")
+                      self.broker.buy(date, symbol, close_price, quantity)
+                      self.invested[symbol] = True
+                 else:
+                      print(f"[{date}] Insufficient cash for benchmark buy of {symbol}. Needed: {cost:.2f}, Has: {self.broker.cash:.2f}")

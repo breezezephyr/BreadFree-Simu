@@ -1,23 +1,16 @@
 from openai import OpenAI
 import os
-import logging
 from datetime import datetime
 
-# Ensure you set this environment variable or replace it with your actual key
-HUNYUAN_API_KEY = os.environ.get("HUNYUAN_API_KEY", "YOUR_API_KEY_HERE")
+from breadfree.utils.logger import get_logger
+logging = get_logger(__name__, mode="file")
 
-# Configure logging
-log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "logs")
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir)
-    
-logging.basicConfig(
-    filename=os.path.join(log_dir, "llm_debug.log"),
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    encoding='utf-8'
-)
-logger = logging.getLogger(__name__)
+# Ensure you set this environment variable or replace it with your actual key
+HUNYUAN_API_KEY = os.environ.get("HUNYUAN_API_KEY")
+if not HUNYUAN_API_KEY or HUNYUAN_API_KEY == "YOUR_API_KEY_HERE":
+    raise RuntimeError("未检测到有效的 HUNYUAN_API_KEY 环境变量，请设置后重试。")
+
+
 
 async def async_hunyuan_chat(
         query=None,

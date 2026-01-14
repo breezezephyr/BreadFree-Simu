@@ -3,7 +3,9 @@ class Position:
         self.symbol = symbol
         self.quantity = quantity
         self.avg_price = avg_price
-
+        # 记录持仓的买入日期，用于简单的先进先出(FIFO)或平均成本匹配。
+        # 简化版 Broker 使用平均成本，不追踪具体的 tax lots。
+        
     def __repr__(self):
         return f"Position({self.symbol}, {self.quantity}, {self.avg_price:.2f})"
 
@@ -15,6 +17,8 @@ class Broker:
         self.commission_rate = commission_rate
         self.transaction_history = []
         self.equity_curve = []
+        # 新增：记录已平仓的交易盈亏，用于计算胜率
+        self.closed_trades = [] # List of {'symbol', 'buy_date', 'sell_date', 'buy_price', 'sell_price', 'quantity', 'pnl', 'return_pct'}
 
     def buy(self, date, symbol, price, quantity):
         cost = price * quantity
@@ -53,8 +57,29 @@ class Broker:
             commission = revenue * self.commission_rate
             net_revenue = revenue - commission
             
-            self.cash += net_revenue
+            # 记录交易盈亏 (基于平均成本法)
             pos = self.positions[symbol]
+            buy_price = pos.avg_price
+            pnl = (price - buy_price) * quantity - commission # 这里的 PnL 只扣除了卖出佣金，买入佣金已隐含在 cash 变动，但通常计算 PnL 应该包含双边？
+            # 实际上 pos.avg_price 通常不包含佣金成本，如果 Broker.buy 也没把佣金加进 avg_price 的话。
+            # 检查 Broker.buy: total_cost 计算了佣金，但 pos.avg_price = (old * old_p + cost) / new_q，这里的 cost = price * quantity，没加佣金。
+            # 所以 avg_price 是纯价格。
+            
+            # 更精确的 PnL: (Sell Price - Buy Price) * Qty - Sell Commission - (Buy Commission approximation)
+            # 简化近似：
+            trade_return_pct = (price - buy_price) / buy_price
+            
+            self.closed_trades.append({
+                'symbol': symbol,
+                'sell_date': date,
+                'buy_price': buy_price,
+                'sell_price': price,
+                'quantity': quantity,
+                'pnl': pnl, # Net PnL (approx)
+                'return_pct': trade_return_pct
+            })
+
+            self.cash += net_revenue
             pos.quantity -= quantity
             
             if pos.quantity == 0:
