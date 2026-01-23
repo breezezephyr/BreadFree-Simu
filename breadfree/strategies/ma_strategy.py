@@ -9,7 +9,7 @@ from breadfree.utils.logger import get_logger
 logger = get_logger(__name__)
 
 class DoubleMAStrategy(BreadFreeStrategy):
-    def __init__(self, broker, short_window=5, long_window=20, lot_size=100, max_position_pct: float = 1.0):
+    def __init__(self, broker, short_window=5, long_window=20, lot_size=100, max_position_pct: float = 1.0, **kwargs):
         """Double moving average strategy.
 
         Args:
@@ -20,6 +20,7 @@ class DoubleMAStrategy(BreadFreeStrategy):
             max_position_pct: fraction of available cash to use when opening a position (0.0-1.0)
         """
         super().__init__(broker, lot_size=lot_size)
+        self.params = kwargs
         self.short_window = short_window
         self.long_window = long_window
         self.max_position_pct = float(max_position_pct)
@@ -41,6 +42,17 @@ class DoubleMAStrategy(BreadFreeStrategy):
             # Ensure history list exists
             if symbol not in self.history:
                 self.history[symbol] = []
+            elif not isinstance(self.history[symbol], list):
+                hist = self.history[symbol]
+                if isinstance(hist, pd.DataFrame):
+                    if 'close' in hist.columns:
+                        self.history[symbol] = hist['close'].tolist()
+                    else:
+                        self.history[symbol] = hist.iloc[:, -1].tolist()
+                elif isinstance(hist, pd.Series):
+                    self.history[symbol] = hist.tolist()
+                else:
+                    self.history[symbol] = list(hist)
 
             self.history[symbol].append(close_price)
 

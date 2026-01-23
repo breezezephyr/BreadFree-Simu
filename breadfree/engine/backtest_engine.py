@@ -6,19 +6,20 @@ import matplotlib.pyplot as plt
 from pyecharts.charts import Line, Grid
 from pyecharts import options as opts
 from ..data.data_fetcher import DataFetcher
+from ..data.database import get_db_manager
 from .broker import Broker
 from ..utils.metrics import *
 from ..utils.plotter import plot_backtest_results
 
 class BacktestEngine:
-    def __init__(self, strategy_cls, symbols, start_date, end_date, initial_cash=100000.0, asset_type="stock", lot_size=100, **kwargs):
-        self.data_fetcher = DataFetcher(data_dir="breadfree/data/cache")
+    def __init__(self, strategy_cls, symbols, start_date, end_date, initial_cash=100000.0, asset_type="stock", lot_size=100, data_source="akshare", tushare_token=None, **kwargs):
+        self.data_fetcher = DataFetcher(data_dir="breadfree/data/cache", data_source=data_source, tushare_token=tushare_token)
         self.broker = Broker(initial_cash=initial_cash)
         
-        # 传递额外的策略参数
+        # Pass additional strategy parameters
         self.strategy = strategy_cls(self.broker, lot_size=lot_size, **kwargs)
         
-        # 支持传入单个 symbol 字符串或 symbol 列表
+        # Support passing single symbol string or symbol list
         if isinstance(symbols, str):
             self.symbols = [symbols]
         else:
@@ -40,26 +41,40 @@ class BacktestEngine:
             print(f"Invalid date format: {self.start_date}. Expected YYYYMMDD.")
             return
 
-        print(f"Fetching data for {len(self.symbols)} symbols from {fetch_start_date} to {self.end_date}...")
+        print(f"Fetching data from database for {len(self.symbols)} symbols from {fetch_start_date} to {self.end_date}...")
         
-        # 准备数据容器
+        # Prepare data containers
         all_dates = set()
         warmup_data_map = {}
         backtest_data_map = {}
+        db_manager = get_db_manager()
 
         for symbol in self.symbols:
-            df = self.data_fetcher.fetch_data(symbol, fetch_start_date, self.end_date, asset_type=self.asset_type)
+            # Use database manager to fetch data (Works for both Stocks and ETFs)
+            df = db_manager.get_daily_data(symbol, fetch_start_date, self.end_date)
+            
             if df.empty:
-                print(f"Warning: No data for {symbol}")
-                continue
+                print(f"Warning: No data for {symbol} in database. Please ensure it is imported.")
+                # 采用data_fetcher尝试获取数据
+                df = self.data_fetcher.fetch_a_stock_daily(symbol, fetch_start_date, self.end_date)
+                if df.empty:
+                    print(f"Error: Unable to fetch data for {symbol}. Skipping.")
+                    continue
+                else:
+                    print(f"Data for {symbol} fetched from data source, {len(df)} records.")
+            
+            # Ensure trade_date is the index
+            if 'trade_date' in df.columns:
+                df['trade_date'] = pd.to_datetime(df['trade_date'])
+                df.set_index('trade_date', inplace=True)
                 
             if not isinstance(df.index, pd.DatetimeIndex):
                  df.index = pd.to_datetime(df.index)
             
-            # 存储数据
+            # Store data
             self.data_map[symbol] = df
             
-            # 分割 Warmup 和 Backtest
+            # Split Warmup and Backtest
             warmup = df[df.index < start_dt]
             backtest = df[df.index >= start_dt]
             
@@ -81,17 +96,17 @@ class BacktestEngine:
             
         # Preload history if supported
         if hasattr(self.strategy, 'preload_history'):
-            # 传递 warmup 数据的字典
+            # Pass dictionary of warmup data
             self.strategy.preload_history(warmup_data_map)
 
         print(f"Starting backtest from {self.start_date} to {self.end_date}")
         print(f"Initial Cash: {self.broker.cash}")
 
         # 3. Loop through time
-        last_prices = {} # 用于在某股票停牌时估算市值
+        last_prices = {} # Used to estimate market value if a stock is suspended
         
         for date in sorted_dates:
-            # 构建当天的 bars 字典
+            # Construct daily bars dictionary
             bars = {}
             for symbol, df in backtest_data_map.items():
                 if date in df.index:
@@ -103,11 +118,11 @@ class BacktestEngine:
                 continue
 
             # Run Strategy
-            # on_bar 接收 (date, bars_dict)
+            # on_bar receives (date, bars_dict)
             self.strategy.on_bar(date, bars)
             
             # Record Equity
-            # 使用 last_prices 确保即使某只股票今天无交易，也能计算持仓市值
+            # Use last_prices to ensure position value calculation even if a stock has no trades today
             equity = self.broker.get_total_equity(last_prices)
             self.broker.equity_curve.append({'date': date, 'equity': equity})
 
@@ -119,14 +134,15 @@ class BacktestEngine:
         final_equity = self.broker.equity_curve[-1]['equity']
         equity_series = pd.Series([d['equity'] for d in self.broker.equity_curve])
         
-        # 使用统一的工具函数计算指标
+        # Use unified utility functions to calculate metrics
         final_return = calculate_total_return(equity_series, initial_capital=self.broker.initial_cash)
         max_drawdown = calculate_max_drawdown(equity_series)
         sharpe_ratio = calculate_sharpe_ratio(equity_series)
-        annualized_return = calculate_annualized_return(equity_series, annual_days=242)
+        annualized_return = calculate_annualized_return(equity_series, annual_days=242)        
         
         # 5. Calculate Trade Statistics
         trade_returns = [t['return_pct'] for t in self.broker.closed_trades]
+        profit_loss_ratio = calculate_profit_loss_ratio(trade_returns)
         win_rate, win_count, total_trades = calculate_win_rate(trade_returns)
         # calculate_calmar_ratio
         calmar_ratio = calculate_calmar_ratio(annualized_return, abs(max_drawdown), risk_free_rate=0.015)
@@ -139,6 +155,7 @@ class BacktestEngine:
         print(f"Calmar Ratio: {calmar_ratio:.2f}")
         print(f"Max Drawdown: {max_drawdown:.2%}")
         print(f"Win Rate: {win_rate:.2%} ({win_count}/{total_trades})")
+        print(f"Profit/Loss Ratio: {profit_loss_ratio:.2f}")
 
         # 6. Plot Results
         # self.plot_results()
@@ -193,7 +210,7 @@ class BacktestEngine:
 
         # Save figure
         plt.savefig(filename)
-        print(f"结果图表已保存至 {filename}")
+        print(f"Result chart saved to {filename}")
 
         # Close the plot to free memory
         plt.close()

@@ -11,12 +11,13 @@ class Position:
 
 class Broker:
     def __init__(self, initial_cash=100000.0, commission_rate=0.0003):
-        self.initial_cash = initial_cash
-        self.cash = initial_cash
+        self.initial_cash = initial_cash # 初始资金
+        self.cash = initial_cash # 当前可用资金
         self.positions = {} # symbol -> Position
         self.commission_rate = commission_rate
         self.transaction_history = []
-        self.equity_curve = []
+        self.equity_curve = [] # 记录每日权益变化
+        self.current_equity = initial_cash # 当前总权益（现金 + 持仓市值）
         # 新增：记录已平仓的交易盈亏，用于计算胜率
         self.closed_trades = [] # List of {'symbol', 'buy_date', 'sell_date', 'buy_price', 'sell_price', 'quantity', 'pnl', 'return_pct'}
 
@@ -46,6 +47,7 @@ class Broker:
                 'commission': commission,
                 'cash_remaining': self.cash
             })
+            self.current_equity = self.get_total_equity({symbol: price})
             return True
         else:
             print(f"[{date}] Insufficient cash to buy {symbol}. Needed: {total_cost:.2f}, Available: {self.cash:.2f}")
@@ -94,6 +96,7 @@ class Broker:
                 'commission': commission,
                 'cash_remaining': self.cash
             })
+            self.current_equity = self.get_total_equity({symbol: price})
             return True
         else:
             print(f"[{date}] Insufficient positions to sell {symbol}.")

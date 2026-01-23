@@ -26,7 +26,7 @@ class BreadFreeStrategy:
         """
         for symbol, df in history_map.items():
             if not df.empty and 'close' in df.columns:
-                # 均线等指标计算通常只需要 Close
+                # Moving average and other indicator calculations typically only need Close
                 self.history[symbol] = df['close'].tolist()
                 logger.info(f"{self.__class__.__name__}: Preloaded {len(self.history[symbol])} days of history for {symbol}.")
 

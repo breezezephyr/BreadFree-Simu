@@ -5,9 +5,9 @@ from scipy import stats
 
 def calculate_max_drawdown(equity_series: pd.Series) -> float:
     """
-    计算最大回撤
-    :param equity_series: 净值序列
-    :return: 最大回撤 (负数)
+    Calculate maximum drawdown
+    :param equity_series: Equity series
+    :return: Maximum drawdown (negative value)
     """
     if equity_series.empty:
         return 0.0
@@ -17,34 +17,34 @@ def calculate_max_drawdown(equity_series: pd.Series) -> float:
 
 def calculate_sharpe_ratio(equity_series: pd.Series, risk_free_rate: float = 0.02, annual_days: int = 242) -> float:
     """
-    计算夏普比率 (基于日收益率)
-    :param equity_series: 净值序列
-    :param risk_free_rate: 无风险收益率 (年化)，默认 2%
-    :param annual_days: 交易日个数，A股通常为 242 左右
-    :return: 夏普比率
+    Calculate Sharpe ratio (based on daily returns)
+    :param equity_series: Equity series
+    :param risk_free_rate: Risk-free rate (annualized), default 2%
+    :param annual_days: Number of trading days, A-shares typically around 242
+    :return: Sharpe ratio
     """
     if len(equity_series) < 2:
         return 0.0
     
-    # 计算日收益率
+    # Calculate daily returns
     daily_returns = equity_series.pct_change().dropna()
     
     if daily_returns.std() == 0:
         return 0.0
         
-    # 日均超额收益
+    # Daily excess returns
     daily_rf = risk_free_rate / annual_days
     excess_returns = daily_returns - daily_rf
     
-    # 年化收益 / 年化波动
+    # Annualized return / Annualized volatility
     sharpe = (excess_returns.mean() / daily_returns.std()) * (annual_days ** 0.5)
     return float(sharpe)
 
 def calculate_total_return(equity_series: pd.Series, initial_capital: float = None) -> float:
     """
-    计算总收益率
-    :param equity_series: 净值序列
-    :param initial_capital: 初始资金 (可选，如果提供则基于初始资金计算，否则基于序列首项)
+    Calculate total return
+    :param equity_series: Equity series
+    :param initial_capital: Initial capital (optional, if provided calculate based on initial capital, otherwise based on first value of series)
     """
     if equity_series.empty:
         return 0.0
@@ -59,7 +59,7 @@ def calculate_total_return(equity_series: pd.Series, initial_capital: float = No
 
 def calculate_annualized_return(equity_series: pd.Series, annual_days: int = 242) -> float:
     """
-    计算年化收益率
+    Calculate annualized return
     """
     if len(equity_series) < 2:
         return 0.0
@@ -74,11 +74,11 @@ def calculate_annualized_return(equity_series: pd.Series, annual_days: int = 242
 
 def calculate_calmar_ratio(annual_return: float, max_drawdown: float, risk_free_rate: float = 0.02) -> float:
     """
-    计算卡玛比率 (年化收益 / 最大回撤)
-    :param annual_return: 年化收益率
-    :param max_drawdown: 最大回撤（绝对值，正数）
-    :param risk_free_rate: 无风险收益率
-    :return: 卡玛比率
+    Calculate Calmar ratio (Annual Return / Max Drawdown)
+    :param annual_return: Annualized return
+    :param max_drawdown: Maximum drawdown (absolute value, positive)
+    :param risk_free_rate: Risk-free rate
+    :return: Calmar ratio
     """
     if max_drawdown == 0:
         return 0.0
@@ -87,12 +87,12 @@ def calculate_calmar_ratio(annual_return: float, max_drawdown: float, risk_free_
 def calculate_sortino_ratio(equity_series: pd.Series, risk_free_rate: float = 0.02,
                            annual_days: int = 242, target_return: float = 0.0) -> float:
     """
-    计算索提诺比率 (考虑下行风险)
-    :param equity_series: 净值序列
-    :param risk_free_rate: 无风险收益率
-    :param annual_days: 年交易日数
-    :param target_return: 目标收益率 (默认0)
-    :return: 索提诺比率
+    Calculate Sortino ratio (downside risk adjusted)
+    :param equity_series: Equity series
+    :param risk_free_rate: Risk-free rate
+    :param annual_days: Annual trading days
+    :param target_return: Target return (default 0)
+    :return: Sortino ratio
     """
     if len(equity_series) < 2:
         return 0.0
@@ -101,7 +101,7 @@ def calculate_sortino_ratio(equity_series: pd.Series, risk_free_rate: float = 0.
     daily_target = target_return / annual_days
     daily_rf = risk_free_rate / annual_days
     
-    # 计算下行偏差 (只考虑低于目标收益的部分)
+    # Calculate downside deviation (only for returns below target)
     downside_returns = daily_returns[daily_returns < daily_target] - daily_target
     if len(downside_returns) == 0:
         downside_std = 0
@@ -120,11 +120,11 @@ def calculate_information_ratio(portfolio_returns: pd.Series,
                                benchmark_returns: pd.Series,
                                annual_days: int = 242) -> float:
     """
-    计算信息比率 (超额收益的稳定性)
-    :param portfolio_returns: 投资组合收益率序列 (日频)
-    :param benchmark_returns: 基准收益率序列 (日频)
-    :param annual_days: 年交易日数
-    :return: 信息比率
+    Calculate Information Ratio (stability of excess returns)
+    :param portfolio_returns: Portfolio return series (daily)
+    :param benchmark_returns: Benchmark return series (daily)
+    :param annual_days: Annual trading days
+    :return: Information ratio
     """
     if len(portfolio_returns) != len(benchmark_returns) or len(portfolio_returns) < 2:
         return 0.0
@@ -141,8 +141,8 @@ def calculate_alpha_beta(portfolio_returns: pd.Series,
                         risk_free_rate: float = 0.02,
                         annual_days: int = 242) -> Tuple[float, float]:
     """
-    计算Alpha和Beta系数
-    :return: (alpha年化, beta)
+    Calculate Alpha and Beta coefficients
+    :return: (Annualized Alpha, Beta)
     """
     if len(portfolio_returns) != len(benchmark_returns) or len(portfolio_returns) < 2:
         return 0.0, 1.0
@@ -151,7 +151,7 @@ def calculate_alpha_beta(portfolio_returns: pd.Series,
     excess_portfolio = portfolio_returns - daily_rf
     excess_benchmark = benchmark_returns - daily_rf
     
-    # 计算Beta (协方差 / 方差)
+    # Calculate Beta (Covariance / Variance)
     covariance = np.cov(excess_portfolio, excess_benchmark)[0, 1]
     benchmark_var = np.var(excess_benchmark)
     
@@ -160,7 +160,7 @@ def calculate_alpha_beta(portfolio_returns: pd.Series,
     else:
         beta = covariance / benchmark_var
     
-    # 计算Alpha
+    # Calculate Alpha
     alpha_daily = excess_portfolio.mean() - beta * excess_benchmark.mean()
     alpha_annual = alpha_daily * annual_days
     
@@ -170,7 +170,7 @@ def calculate_tracking_error(portfolio_returns: pd.Series,
                            benchmark_returns: pd.Series,
                            annual_days: int = 242) -> float:
     """
-    计算跟踪误差 (年化)
+    Calculate Tracking Error (annualized)
     """
     if len(portfolio_returns) != len(benchmark_returns) or len(portfolio_returns) < 2:
         return 0.0
@@ -182,9 +182,9 @@ def calculate_tracking_error(portfolio_returns: pd.Series,
 
 def calculate_win_rate(trade_returns: List[float]) -> Tuple[float, int, int]:
     """
-    计算胜率、胜场数、总交易数
-    :param trade_returns: 每笔交易的收益率列表
-    :return: (胜率, 胜场数, 总交易数)
+    Calculate win rate, win count, and total trades
+    :param trade_returns: List of returns per trade
+    :return: (Win rate, win count, total trades)
     """
     if not trade_returns:
         return 0.0, 0, 0
@@ -197,7 +197,7 @@ def calculate_win_rate(trade_returns: List[float]) -> Tuple[float, int, int]:
 
 def calculate_profit_factor(gross_profits: float, gross_losses: float) -> float:
     """
-    计算盈利因子 (总盈利 / 总亏损)
+    Calculate Profit Factor (Gross Profits / Gross Losses)
     """
     if gross_losses == 0:
         return float('inf') if gross_profits > 0 else 0.0
@@ -205,7 +205,7 @@ def calculate_profit_factor(gross_profits: float, gross_losses: float) -> float:
 
 def calculate_average_win_loss(trade_returns: List[float]) -> Tuple[float, float]:
     """
-    计算平均盈利和平均亏损
+    Calculate average profit and average loss
     """
     if not trade_returns:
         return 0.0, 0.0
@@ -220,7 +220,7 @@ def calculate_average_win_loss(trade_returns: List[float]) -> Tuple[float, float
 
 def calculate_max_consecutive_wins_losses(trade_returns: List[float]) -> Tuple[int, int]:
     """
-    计算最大连续盈利和最大连续亏损次数
+    Calculate maximum consecutive wins and losses
     """
     if not trade_returns:
         return 0, 0
@@ -245,12 +245,12 @@ def calculate_max_consecutive_wins_losses(trade_returns: List[float]) -> Tuple[i
 def calculate_r_squared(portfolio_returns: pd.Series, 
                        benchmark_returns: pd.Series) -> float:
     """
-    计算R平方 (拟合优度)
+    Calculate R-squared (goodness of fit)
     """
     if len(portfolio_returns) != len(benchmark_returns) or len(portfolio_returns) < 2:
         return 0.0
     
-    # 使用线性回归计算R平方
+    # Use linear regression for R-squared
     slope, intercept, r_value, p_value, std_err = stats.linregress(
         benchmark_returns, portfolio_returns
     )
@@ -259,7 +259,7 @@ def calculate_r_squared(portfolio_returns: pd.Series,
 
 def calculate_volatility(returns_series: pd.Series, annual_days: int = 242) -> float:
     """
-    计算年化波动率
+    Calculate annualized volatility
     """
     if len(returns_series) < 2:
         return 0.0
@@ -270,19 +270,19 @@ def calculate_value_at_risk(returns_series: pd.Series,
                            confidence_level: float = 0.95,
                            method: str = 'historical') -> float:
     """
-    计算在险价值 (VaR)
-    :param confidence_level: 置信水平
-    :param method: 计算方法 - 'historical'历史法, 'parametric'参数法
-    :return: VaR值 (负数表示损失)
+    Calculate Value at Risk (VaR)
+    :param confidence_level: Confidence level
+    :param method: Method - 'historical' or 'parametric'
+    :return: VaR value (negative denotes loss)
     """
     if len(returns_series) < 2:
         return 0.0
     
     if method == 'historical':
-        # 历史模拟法
+        # Historical simulation
         var = np.percentile(returns_series, (1 - confidence_level) * 100)
     else:
-        # 参数法 (正态分布假设)
+        # Parametric method (Assuming normal distribution)
         mean = returns_series.mean()
         std = returns_series.std()
         from scipy.stats import norm
@@ -293,8 +293,8 @@ def calculate_value_at_risk(returns_series: pd.Series,
 def calculate_conditional_var(returns_series: pd.Series,
                             confidence_level: float = 0.95) -> float:
     """
-    计算条件在险价值 (CVaR/Expected Shortfall)
-    即超过VaR部分的平均损失
+    Calculate Conditional Value at Risk (CVaR / Expected Shortfall)
+    Represents the average loss exceeding VaR
     """
     if len(returns_series) < 2:
         return 0.0
@@ -306,13 +306,13 @@ def calculate_conditional_var(returns_series: pd.Series,
 
 def calculate_skewness_kurtosis(returns_series: pd.Series) -> Tuple[float, float]:
     """
-    计算收益率序列的偏度和峰度
+    Calculate skewness and kurtosis of returns series
     """
     if len(returns_series) < 2:
         return 0.0, 0.0
     
     skewness = float(returns_series.skew())
-    kurtosis = float(returns_series.kurtosis())  # 超额峰度
+    kurtosis = float(returns_series.kurtosis())  # Excess kurtosis
     
     return skewness, kurtosis
 
@@ -321,7 +321,7 @@ def calculate_jensen_alpha(portfolio_returns: pd.Series,
                           risk_free_rate: float = 0.02,
                           annual_days: int = 242) -> float:
     """
-    计算詹森阿尔法 (基于CAPM模型)
+    Calculate Jensen's Alpha (based on CAPM)
     """
     alpha, beta = calculate_alpha_beta(
         portfolio_returns, benchmark_returns, risk_free_rate, annual_days
@@ -330,7 +330,7 @@ def calculate_jensen_alpha(portfolio_returns: pd.Series,
 
 def calculate_ulcer_index(equity_series: pd.Series) -> float:
     """
-    计算溃疡指数 (衡量下跌波动性)
+    Calculate Ulcer Index (measures downside volatility)
     """
     if len(equity_series) < 2:
         return 0.0
@@ -345,7 +345,7 @@ def calculate_ulcer_index(equity_series: pd.Series) -> float:
 def calculate_omega_ratio(returns_series: pd.Series,
                          threshold: float = 0.0) -> float:
     """
-    计算Omega比率 (收益高于阈值的概率加权)
+    Calculate Omega Ratio (probability-weighted ratio of gains vs losses)
     """
     if len(returns_series) < 2:
         return 0.0
@@ -359,22 +359,52 @@ def calculate_omega_ratio(returns_series: pd.Series,
     omega = gains.sum() / losses.sum()
     return float(omega)
 
+def calculate_ema(series: pd.Series, period: int) -> pd.Series:
+    """
+    Calculate Exponential Moving Average (EMA)
+    :param series: Input series
+    :param period: EMA period
+    :return: EMA series
+    """
+    return series.ewm(span=period, adjust=False).mean()
+
+def calculate_macd(series: pd.Series,
+                   short_period: int = 12,
+                   long_period: int = 26,
+                   signal_period: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    Calculate MACD indicators
+    :param series: Input series
+    :param short_period: Short EMA period
+    :param long_period: Long EMA period
+    :param signal_period: Signal line EMA period
+    :return: (MACD line, Signal line, Histogram)
+    """
+    ema_short = calculate_ema(series, short_period)
+    ema_long = calculate_ema(series, long_period)
+    
+    macd_line = ema_short - ema_long
+    signal_line = calculate_ema(macd_line, signal_period)
+    histogram = macd_line - signal_line
+    
+    return macd_line, signal_line, histogram
+
 def calculate_all_metrics(equity_series: pd.Series,
                          trade_returns: List[float] = None,
                          benchmark_returns: pd.Series = None,
                          risk_free_rate: float = 0.02,
                          annual_days: int = 242) -> Dict:
     """
-    计算所有指标的综合函数
+    Comprehensive function to calculate all performance metrics
     """
     metrics = {}
     
-    # 基本收益指标
+    # Base return metrics
     metrics['total_return'] = calculate_total_return(equity_series)
     metrics['annualized_return'] = calculate_annualized_return(equity_series, annual_days)
     metrics['max_drawdown'] = calculate_max_drawdown(equity_series)
     
-    # 风险调整收益指标
+    # Risk-adjusted return metrics
     daily_returns = equity_series.pct_change().dropna() if len(equity_series) > 1 else pd.Series()
     if not daily_returns.empty:
         metrics['sharpe_ratio'] = calculate_sharpe_ratio(equity_series, risk_free_rate, annual_days)
@@ -382,16 +412,16 @@ def calculate_all_metrics(equity_series: pd.Series,
         metrics['calmar_ratio'] = calculate_calmar_ratio(equity_series, risk_free_rate, annual_days)
         metrics['volatility'] = calculate_volatility(daily_returns, annual_days)
         
-        # 分布特征
+        # Distribution characteristics
         metrics['skewness'], metrics['kurtosis'] = calculate_skewness_kurtosis(daily_returns)
         
-        # 风险指标
+        # Risk metrics
         metrics['var_95'] = calculate_value_at_risk(daily_returns, 0.95)
         metrics['cvar_95'] = calculate_conditional_var(daily_returns, 0.95)
         metrics['ulcer_index'] = calculate_ulcer_index(equity_series)
         metrics['omega_ratio'] = calculate_omega_ratio(daily_returns)
     
-    # 交易统计
+    # Trade statistics
     if trade_returns:
         win_rate, wins, total = calculate_win_rate(trade_returns)
         metrics['win_rate'] = win_rate
@@ -405,20 +435,22 @@ def calculate_all_metrics(equity_series: pd.Series,
         
         if avg_loss != 0:
             metrics['win_loss_ratio'] = abs(avg_win / avg_loss)
+        else:
+            metrics['win_loss_ratio'] = float('inf')
         
-        # 计算总盈利和总亏损
+        # Calculate gross profit and loss
         gross_profits = sum(r for r in trade_returns if r > 0)
         gross_losses = sum(r for r in trade_returns if r < 0)
         metrics['gross_profit'] = gross_profits
         metrics['gross_loss'] = gross_losses
         metrics['profit_factor'] = calculate_profit_factor(gross_profits, gross_losses)
         
-        # 连续统计
+        # Consecutive statistics
         max_wins, max_losses = calculate_max_consecutive_wins_losses(trade_returns)
         metrics['max_consecutive_wins'] = max_wins
         metrics['max_consecutive_losses'] = max_losses
     
-    # 相对基准指标
+    # Relative benchmark metrics
     if benchmark_returns is not None and not daily_returns.empty:
         metrics['information_ratio'] = calculate_information_ratio(
             daily_returns, benchmark_returns, annual_days
@@ -435,6 +467,86 @@ def calculate_all_metrics(equity_series: pd.Series,
         )
     
     return metrics
+
+def calculate_profit_loss_ratio(trade_returns: List[float]) -> float:
+    """
+    Calculate Profit/Loss ratio (average profit / average loss)
+    :param trade_returns: List of returns per trade
+    :return: Profit/Loss ratio
+    """
+    avg_win, avg_loss = calculate_average_win_loss(trade_returns)
+    if avg_loss == 0:
+        return float('inf') if avg_win > 0 else 0.0
+    return float(avg_win / abs(avg_loss))
+
+def stable_linear_regression(prices: np.ndarray) -> Tuple[float, float, float]:
+    """
+    Perform a stable linear regression using numpy vectorization.
+    :param prices: Array of prices
+    :return: (slope, intercept, r2)
+    """
+    n = len(prices)
+    if n < 2:
+        return 0.0, 0.0, 0.0
+    try:
+        x = np.arange(n)
+        
+        x_mean = np.mean(x)
+        y_mean = np.mean(prices)
+        
+        numerator = np.sum((x - x_mean) * (prices - y_mean))
+        denominator = np.sum((x - x_mean) ** 2)
+        
+        if denominator == 0:
+            return 0.0, 0.0, 0.0
+            
+        slope = numerator / denominator
+        intercept = y_mean - slope * x_mean
+        
+        # R2 Calculation
+        y_pred = slope * x + intercept
+        ss_res = np.sum((prices - y_pred) ** 2)
+        ss_tot = np.sum((prices - y_mean) ** 2)
+        
+        if ss_tot == 0:
+             r2 = 0.0
+        else:
+             r2 = 1 - (ss_res / ss_tot)
+             
+        return slope, intercept, r2
+    except Exception:
+        return 0.0, 0.0, 0.0
+
+def calculate_efficiency_metrics(history: List[float], lookback: int) -> Optional[Dict[str, float]]:
+    """
+    Calculate momentum, volatility, R2 and efficiency for a given price history.
+    """
+    if len(history) < lookback:
+        return None
+    prices = np.array(history[-lookback:])
+    if len(prices) < 2:
+        return None
+        
+    momentum = (prices[-1] / prices[0] - 1) if prices[0] > 0 else 0
+    returns = np.diff(prices) / prices[:-1]
+    volatility = np.std(returns) if len(returns) > 1 else 0
+
+    # Scale daily volatility to the full period volatility
+    period_volatility = volatility * np.sqrt(len(returns))
+
+    slope, _, r2 = stable_linear_regression(prices)
+    epsilon = 1e-6
+    
+    # Efficiency factor: risk-adjusted momentum scaled by trend quality (R2)
+    efficiency = (momentum / (period_volatility + epsilon)) * r2
+    
+    return {
+        "momentum": momentum,
+        "volatility": volatility,
+        "r2": r2,
+        "efficiency": efficiency,
+        "close": float(prices[-1])
+    }
 
 # 使用示例
 if __name__ == "__main__":
@@ -463,7 +575,7 @@ if __name__ == "__main__":
     )
     
     # 打印结果
-    print("=== 绩效指标汇总 ===")
+    print("=== Performance Metrics Summary ===")
     for key, value in metrics.items():
         if isinstance(value, float):
             print(f"{key:25s}: {value:.4f}")

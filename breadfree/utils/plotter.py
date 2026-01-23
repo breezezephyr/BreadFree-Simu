@@ -5,48 +5,48 @@ from .metrics import calculate_max_drawdown, calculate_sharpe_ratio
 
 def plot_backtest_results(equity_curve, transaction_history, benchmark_series=None, initial_cash=100000.0, title="Backtest Result", filename="backtest_result.html"):
     """
-    绘制回测结果图表 (支持多股/资产组合)
-    
+    Plot backtest results chart (supports multi-stock/portfolio)
+
     Args:
         equity_curve: list of dict, e.g. [{'date': datetime, 'equity': float}, ...]
         transaction_history: list of dict, e.g. [{'date': datetime, 'action': 'BUY', ...}, ...]
-        benchmark_series: pd.Series, index为日期, values为基准价格/净值. 可选.
-        initial_cash: float, 初始资金
-        title: str, 图表标题
-        filename: str, 保存文件名
+        benchmark_series: pd.Series, index is date, values are benchmark prices/net value. Optional.
+        initial_cash: float, initial capital
+        title: str, chart title
+        filename: str, save filename
     """
     if not equity_curve:
         print("No results to plot.")
         return
 
-    # 1. 准备策略净值数据
+    # 1. Prepare strategy equity data
     equity_values = [d['equity'] for d in equity_curve]
-    # 确保日期格式化为字符串
+    # Ensure dates are formatted as strings
     dates = [d['date'].strftime('%Y-%m-%d') if hasattr(d['date'], 'strftime') else str(d['date']) for d in equity_curve]
     
     equity_series = pd.Series(equity_values, index=pd.to_datetime(dates))
 
-    # 2. 准备基准数据 (如果有)
+    # 2. Prepare benchmark data (if available)
     benchmark_equity = []
     if benchmark_series is not None and not benchmark_series.empty:
-        # 对齐日期
-        # benchmark_series 的索引应该是 datetime 类型
+        # Align dates
+        # benchmark_series index should be datetime type
         if not isinstance(benchmark_series.index, pd.DatetimeIndex):
             benchmark_series.index = pd.to_datetime(benchmark_series.index)
             
         common_dates = benchmark_series.index.intersection(equity_series.index)
         
         if not common_dates.empty:
-            # 截取对应时间段并归一化到初始资金
+            # Extract corresponding time period and normalize to initial capital
             aligned_benchmark = benchmark_series.loc[common_dates]
-            # 按回测日期的顺序重新索引 (处理停牌或日期缺失情况，这里简单做交集处理)
-            # 为了画图方便，我们在 dates 列表里找对应的基准值
-            # 如果 dates 里的日期在 benchmark 里没有，就填充前值或者 None
+            # Reindex according to backtest date order (handling suspension or missing dates, simple intersection approach)
+            # For plotting convenience, we find corresponding benchmark values in the dates list
+            # If a date in dates is not in benchmark, fill with previous value or None
             
-            # 更简单的方法:
-            # 取 benchmark 在 dates 范围内的切片，然后归一化
+            # Simpler method:
+            # Take benchmark slice within dates range, then normalize
             start_price = 0
-            # 找到第一个有效价格用来归一化
+            # Find the first valid price for normalization
             for d in dates:
                 dt = pd.to_datetime(d)
                 if dt in benchmark_series.index:
@@ -54,48 +54,48 @@ def plot_backtest_results(equity_curve, transaction_history, benchmark_series=No
                     break
             
             if start_price > 0:
-                # 生成与 dates 对齐的 benchmark 列表
+                # Generate benchmark list aligned with dates
                 for d in dates:
                     dt = pd.to_datetime(d)
                     if dt in benchmark_series.index:
                         val = benchmark_series.loc[dt]
                         benchmark_equity.append(val / start_price * initial_cash)
                     else:
-                        # 如果缺失，沿用上一个值，或者 None
+                        # If missing, use previous value or None
                         benchmark_equity.append(benchmark_equity[-1] if benchmark_equity else initial_cash)
             else:
                  benchmark_equity = [initial_cash] * len(dates)
         else:
             benchmark_equity = [initial_cash] * len(dates)
     else:
-        # 无基准，填充 None 或不画
+        # No benchmark, fill with None or don't plot
         pass
 
-    # 3. 计算指标
+    # 3. Calculate metrics
     max_drawdown = calculate_max_drawdown(equity_series)
     sharpe_ratio = calculate_sharpe_ratio(equity_series)
     final_return = (equity_values[-1] - initial_cash) / initial_cash
     
-    # 回撤曲线
+    # Drawdown curve
     running_max = equity_series.cummax()
     drawdown = (equity_series - running_max) / running_max
     
     subtitle = f"Total Return: {final_return:.2%} | Sharpe Ratio: {sharpe_ratio:.2f} | Max Drawdown: {max_drawdown:.2%}"
 
-    # 4. 交易标记
+    # 4. Transaction markers
     markers = []
-    # 创建日期到净值的映射，方便查找坐标
+    # Create date to equity mapping for easy coordinate lookup
     date_to_equity = dict(zip(dates, equity_values))
     
     for tx in transaction_history:
         tx_date = tx['date'].strftime('%Y-%m-%d') if hasattr(tx['date'], 'strftime') else str(tx['date'])
         
-        # 只有当交易日期在图表的日期范围内时才标记
+        # Only mark if transaction date is within chart date range
         if tx_date in date_to_equity:
             val = date_to_equity[tx_date]
             action = tx['action']
             
-            # 多股情况下，可以在 tooltip 或 value 中显示 symbol
+            # For multiple stocks, can display symbol in tooltip or value
             symbol_info = tx.get('symbol', '')
             
             if action == 'BUY':
@@ -118,8 +118,8 @@ def plot_backtest_results(equity_curve, transaction_history, benchmark_series=No
                     # tooltip_opts=opts.TooltipOpts(formatter=f"Sell {symbol_info}<br/>Price: {tx['price']}")
                 ))
 
-    # 5. 构建图表
-    # 主图: 净值曲线 + 基准
+    # 5. Build chart
+    # Main chart: Equity curve + benchmark
     line_main = (
         Line()
         .add_xaxis(dates)
@@ -166,7 +166,7 @@ def plot_backtest_results(equity_curve, transaction_history, benchmark_series=No
         legend_opts=opts.LegendOpts(pos_top="5%"),
     )
 
-    # 副图: 回撤
+    # Secondary chart: Drawdown
     line_drawdown = (
         Line()
         .add_xaxis(dates)
@@ -193,7 +193,7 @@ def plot_backtest_results(equity_curve, transaction_history, benchmark_series=No
         )
     )
 
-    # 组合布局
+    # Combine layout
     grid = (
         Grid(init_opts=opts.InitOpts(width="100%", height="800px"))
         .add(line_main, grid_opts=opts.GridOpts(pos_left="5%", pos_right="5%", height="60%"))

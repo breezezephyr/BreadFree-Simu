@@ -1,6 +1,6 @@
 """
-统一日志入口。
-用法：
+Unified logging entry point.
+Usage:
 from breadfree.utils.logger import get_logger
 logger = get_logger(__name__, mode="all")
 """
@@ -31,7 +31,7 @@ def _basic_formatter() -> logging.Formatter:
 def get_logger(
     name: str | None = None,
     level: int = logging.INFO,
-    mode: str = "all"  # 新增参数，支持 console/file/all
+    mode: str = "all"  # New parameter, supports console/file/all
 ) -> Logger:
     if name is None:
         name = "breadfree"

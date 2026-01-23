@@ -6,8 +6,9 @@ class BenchmarkStrategy(BreadFreeStrategy):
     Simply buys the asset on the first available opportunity and holds it until the end.
     Used as a baseline to compare other strategies against the market performance.
     """
-    def __init__(self, broker, lot_size=100):
+    def __init__(self, broker, lot_size=100, **kwargs):
         super().__init__(broker, lot_size)
+        self.params = kwargs
         self.invested = {} # {symbol: bool}
 
     def set_symbols(self, symbols):

@@ -8,7 +8,7 @@ etf_pool:
   "513100": "纳指ETF"         # 海外资产
   "512660": "军工ETF"         # 独立行情
   "511260": "国债ETF"         # 避险资产
-  "159949": "黄金ETF"         # 大宗商品
+  "159949": "创业板50ETF"         # 成长风格
 # etf_pool:
   # "510300": "沪深300ETF"      # 大盘基准
   # # "518880": "黄金ETF"         # 大宗商品
@@ -19,17 +19,18 @@ etf_pool:
   # "510180": "上证180ETF"      # 价值股，蓝筹股，中大盘
   # "511010": "国债ETF"         # 防守型
 
-start_date: "20210101"
-end_date: "20251231"
+# start_date: "20210101"
+# end_date: "20251231"
 
 # start_date: "20200101"
 # end_date: "20201231"
 
-# start_date: "20250101"
-# end_date: "20251231"
+start_date: "20210101"
+end_date: "20211231"
 
 initial_cash: 100000.0
 asset_type: "stock"
 lot_size: 100
 commission_rate: 0.0003
+data_source: "akshare" # "akshare" or "tushare"
 strategy: "RotationStrategy" # "DoubleMAStrategy" "AgentStrategy" "BenchmarkStrategy" "RotationStrategy"
