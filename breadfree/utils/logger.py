@@ -43,9 +43,16 @@ def get_logger(
         return logger
 
     if mode in ("console", "all"):
-        ch = logging.StreamHandler()
+        import sys
+        ch = logging.StreamHandler(sys.stdout)
         ch.setLevel(level)
         ch.setFormatter(_basic_formatter())
+        # Force UTF-8 encoding for console output
+        if hasattr(sys.stdout, 'reconfigure'):
+            try:
+                sys.stdout.reconfigure(encoding='utf-8')
+            except Exception:
+                pass
         logger.addHandler(ch)
 
     if mode in ("file", "all"):

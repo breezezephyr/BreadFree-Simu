@@ -48,7 +48,8 @@ A momentum and efficiency-based rotation strategy for ETFs or stocks.
 A multi-agent system simulating an investment committee using LangGraph.
 - **Roles**: Analyst -> Risk Manager -> Fund Manager.
 - **Features**: Reads news, reasons about market sentiment, and adheres to distinct personas.
-- **Configuration**: Requires LLM API keys.
+- **Configuration**: Requires LLM API keys (supports NVIDIA NIM or Tencent Hunyuan).
+- **Setup Guide**: See [docs/nvidia_api_setup.md](docs/nvidia_api_setup.md) for detailed configuration instructions.
 
 ### C. Classic Strategies
 - **DoubleMAStrategy**: Golden cross/Dead cross logic with short and long windows.
@@ -64,7 +65,19 @@ source .venv/bin/activate
 ```
 
 ### 2. Configuration
+**A. Global Settings**  
 Configure global settings in `breadfree/config.yaml` (e.g., initial cash, default stock pool).
+
+**B. LLM API Configuration (Optional - Only for AgentStrategy)**  
+If you want to use the LLM-powered AgentStrategy:
+1. Get a free API key from [NVIDIA Build](https://build.nvidia.com/settings/api-keys)
+2. Configure in `.env` file:
+   ```bash
+   LLM_PROVIDER=nvidia
+   LLM_API_KEY=nvapi-xxxxxxxxxxxxx
+   ```
+3. Test the connection: `python test_nvidia_api.py`
+4. See detailed guide: [docs/nvidia_api_setup.md](docs/nvidia_api_setup.md)
 
 ### 3. Running Backtests
 The entry point `main.py` unifies the execution.

@@ -2,6 +2,23 @@ import sys
 import os
 import argparse
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+# Configure UTF-8 encoding for Windows console
+if sys.platform == 'win32':
+    try:
+        # Set console code page to UTF-8
+        os.system('chcp 65001 >nul 2>&1')
+        # Reconfigure stdout and stderr to use UTF-8
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8')
+        if hasattr(sys.stderr, 'reconfigure'):
+            sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Add the project root to python path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -74,11 +91,14 @@ def main():
     print(f"Start Date: {start_date}, End Date: {end_date}, Initial Cash: {initial_cash}")
     print(f"Data Source: {data_source}")
     print(f"Symbols: {symbols}")
-    print("Hyperparameters:")
-    for param in ["lookback_period", "hold_period", "top_n", "min_momentum", "use_efficiency"]:
-        val = getattr(args, param)
-        if val is not None:
-            print(f"  {param}: {val}")
+    
+    # Only print hyperparameters for strategies that use them
+    if strategy_name not in ["AgentStrategy", "BenchmarkStrategy"]:
+        print("Hyperparameters:")
+        for param in ["lookback_period", "hold_period", "top_n", "min_momentum", "use_efficiency"]:
+            val = getattr(args, param)
+            if val is not None:
+                print(f"  {param}: {val}")
     strategy_cls = strategy_map.get(strategy_name, RotationStrategy)
 
     print(f"Running backtest with {strategy_cls.__name__}...")
@@ -87,23 +107,25 @@ def main():
     # Strategy parameter mapping
     strategy_params = {}
     
-    # Manually map potential hyperparameters
-    param_keys = [
-        "lookback_period", "hold_period", "top_n", 
-        "bias_n", "momentum_day", "slope_n", "rebalance_threshold"
-    ]
-    for key in param_keys:
-        val = getattr(args, key)
-        if val is not None:
-            strategy_params[key] = val
-        elif key in config:
-            strategy_params[key] = config[key]
-            
-    # Special handling for boolean values
-    if args.use_efficiency is not None:
-        strategy_params["use_efficiency"] = args.use_efficiency == True
-    elif "use_efficiency" in config:
-        strategy_params["use_efficiency"] = config["use_efficiency"]
+    # AgentStrategy doesn't need hyperparameters like lookback_period
+    if strategy_name not in ["AgentStrategy"]:
+        # Manually map potential hyperparameters for other strategies
+        param_keys = [
+            "lookback_period", "hold_period", "top_n", 
+            "bias_n", "momentum_day", "slope_n", "rebalance_threshold"
+        ]
+        for key in param_keys:
+            val = getattr(args, key)
+            if val is not None:
+                strategy_params[key] = val
+            elif key in config:
+                strategy_params[key] = config[key]
+                
+        # Special handling for boolean values
+        if args.use_efficiency is not None:
+            strategy_params["use_efficiency"] = args.use_efficiency == True
+        elif "use_efficiency" in config:
+            strategy_params["use_efficiency"] = config["use_efficiency"]
 
     # Create and run backtest
     # Note: BacktestEngine now accepts symbols list

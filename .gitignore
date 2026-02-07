@@ -19,3 +19,8 @@ breadfree/data/cache/
 backtest_result.html
 stock_news.json
 test.py
+.env
+*.db
+quick_test.py
+test_*.txt
+output/

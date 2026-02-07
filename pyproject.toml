@@ -3,7 +3,7 @@ name = "breadfree"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
     "akshare>=1.18.4",
     "curl-cffi>=0.14.0",

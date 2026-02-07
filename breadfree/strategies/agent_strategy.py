@@ -75,13 +75,15 @@ FUND_MANAGER_PROMPT = """
 2. A股特殊约束：所有决策必须考虑T+1交易和涨跌停板
 3. 学习机制：每次决策后必须记录依据，用于后续优化
 
-输出必须是严格JSON格式（无任何额外文本）：
+【重要】输出必须是纯JSON格式，不要使用<think>标签，不要有任何额外说明文本，直接输出JSON：
 {
     "action": "BUY" | "SELL" | "HOLD",
-    "quantity_pct": 0.0 - 1.0, // 买入时占可用资金比例，卖出时占持仓比例
+    "quantity_pct": 0.0 - 1.0,
     "reason": "综合分析：包含市场趋势（技术/政策/情绪）、风险评估等级、A股特性影响（如'涨跌停限制导致仓位≤0.3'）",
     "learning_note": "决策依据与结果记录（例：'2023-10-05政策利好未被计入，下次需增加政策监测'）"
 }
+
+注意：不要使用<think>标签进行思考，直接输出纯JSON对象即可。
 """
 
 # --- Node Functions ---
@@ -111,13 +113,41 @@ async def fund_manager_node(state: AgentState):
     请做出决策。
     """
     response, _ = await async_hunyuan_chat(query=query, prompt=FUND_MANAGER_PROMPT)
-    # Clean up response to ensure it's valid JSON
+    
+    # Import parse function
+    from ..utils.llm_client import parse_llm_response
+    
+    # Clean up response to handle <think> tags and extract JSON
     cleaned_response = response.strip()
+    
+    # Remove <think> tags if present (for models like MiniMax, DeepSeek-R1)
+    import re
+    cleaned_response = re.sub(r'<think>.*?</think>', '', cleaned_response, flags=re.DOTALL).strip()
+    
+    # Remove markdown code blocks
     if cleaned_response.startswith("```json"):
         cleaned_response = cleaned_response[7:]
+    elif cleaned_response.startswith("```"):
+        cleaned_response = cleaned_response[3:]
     if cleaned_response.endswith("```"):
         cleaned_response = cleaned_response[:-3]
-    return {"final_decision": cleaned_response.strip()}
+    
+    cleaned_response = cleaned_response.strip()
+    
+    # If still not valid JSON, try to parse it
+    try:
+        json.loads(cleaned_response)
+    except json.JSONDecodeError:
+        # Use parse_llm_response with fallback
+        fallback = {
+            "action": "HOLD",
+            "quantity_pct": 0.0,
+            "reason": "Failed to parse LLM response"
+        }
+        parsed = parse_llm_response(cleaned_response, fallback)
+        cleaned_response = json.dumps(parsed, ensure_ascii=False)
+    
+    return {"final_decision": cleaned_response}
 
 # --- Graph Construction ---
 def build_graph():
