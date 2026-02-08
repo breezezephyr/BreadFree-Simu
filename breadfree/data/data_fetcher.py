@@ -273,28 +273,21 @@ class DataFetcher:
 
 if __name__ == "__main__":
     path = os.path.join(os.path.dirname(__file__), "cache/top_150_with_sectors.csv")
+    now = pd.Timestamp.now().strftime("%Y%m%d")
+    start = "20050101"
+    fetcher = DataFetcher(data_dir=os.path.join(os.path.dirname(__file__), "cache"))
+
     if os.path.exists(path):
         top150_df = pd.read_csv(path, dtype={"symbol": str})
         print("Top 150:")
         print(top150_df)
+        for _, row in top150_df.iterrows():
+            code = row["symbol"]
+            name = row.get("name", code)
+            print(f"Fetching data for {code} - {name}...")
+            df = fetcher.fetch_a_stock_daily(code, start, now)
     else:
         print(f"Top 150 file not found at {path}")
-    now = pd.Timestamp.now().strftime("%Y%m%d")
-    # 2005年01月01
-    start = "20050101"
-    print(f"Fetching sample stock data for 000001 from {start} to {now}...")
-
-    # 测试代码
-    # fetcher = DataFetcher(data_dir="breadfree/data/cache")
-    # df = fetcher.fetch_a_stock_daily("000001", "20230101", "20231231")
-    # print(df.head())
-
-    # 批量获取并保存
-    for _, row in top150_df.iterrows():
-        code = row['symbol']
-        name = row['name']
-        print(f"Fetching data for {code} - {name}...")
-        fetcher = DataFetcher(data_dir="breadfree/data/cache")
-        df = fetcher.fetch_a_stock_daily(code, start, now)
-
-        # break  # 仅测试第一个
+        print(f"Fetching sample stock data for 000001 from {start} to {now}...")
+        df = fetcher.fetch_a_stock_daily("000001", start, now)
+        print(df.head() if not df.empty else "No data")
