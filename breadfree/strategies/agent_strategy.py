@@ -91,13 +91,23 @@ FUND_MANAGER_PROMPT = """
 async def market_analyst_node(state: AgentState):
     logger.info(f"Market Analyst Node Input: {state}")
     query = f"日期: {state['date']}\n市场数据:\n{state['market_data']}"
-    response, _ = await async_hunyuan_chat(query=query, prompt=ANALYST_PROMPT)
+    # Market Analyst uses QwQ-32B reasoning model for deep thinking and analysis
+    response, _ = await async_hunyuan_chat(
+        query=query, 
+        prompt=ANALYST_PROMPT,
+        model="qwen/qwq-32b"
+    )
     return {"analyst_view": response}
 
 async def risk_manager_node(state: AgentState):
     logger.info(f"Risk Manager Node Input: {state}")
     query = f"日期: {state['date']}\n账户状态:\n{state['account_status']}\n市场分析师观点:\n{state['analyst_view']}"
-    response, _ = await async_hunyuan_chat(query=query, prompt=RISK_MANAGER_PROMPT)
+    # Risk Manager uses MiniMax-M2.1 for conservative risk assessment
+    response, _ = await async_hunyuan_chat(
+        query=query, 
+        prompt=RISK_MANAGER_PROMPT,
+        model="minimaxai/minimax-m2.1"
+    )
     return {"risk_view": response}
 
 async def fund_manager_node(state: AgentState):
@@ -112,7 +122,12 @@ async def fund_manager_node(state: AgentState):
     
     请做出决策。
     """
-    response, _ = await async_hunyuan_chat(query=query, prompt=FUND_MANAGER_PROMPT)
+    # Fund Manager uses DeepSeek-V3.2 for final decision making
+    response, _ = await async_hunyuan_chat(
+        query=query, 
+        prompt=FUND_MANAGER_PROMPT,
+        model="deepseek-ai/deepseek-v3.2"
+    )
     
     # Import parse function
     from ..utils.llm_client import parse_llm_response
