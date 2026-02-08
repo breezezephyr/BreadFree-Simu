@@ -5,7 +5,7 @@ import json
 from typing import Dict, Any, Optional
 
 from breadfree.utils.logger import get_logger
-logging = get_logger(__name__, mode="file")
+logging = get_logger(__name__, mode="all")
 
 # 默认配置（无 config.yaml 或未配置 llm 时使用）
 _DEFAULT_PROVIDERS = {
@@ -105,13 +105,9 @@ async def async_hunyuan_chat(
         if query is not None:
             messages.append({"role": "user", "content": query})
         
-        # Log the request
+        # Log the request（model 便于与下方 token 日志对应）
         logging.info(
-            f"--- LLM Request ---\n"
-            f"Provider: {provider_name}\n"
-            f"Model: {selected_model}\n"
-            f"Query: {query}\n"
-            f"-------------------"
+            f"LLM request | provider={provider_name} | model={selected_model} | query_len={sum(len(m.get('content', '') or '') for m in messages)}"
         )
         completion = client.chat.completions.create(
             model=selected_model,
@@ -122,11 +118,19 @@ async def async_hunyuan_chat(
             stream=stream,
         )
         
-        response_content = completion.choices[0].message.content
-        total_tokens = completion.usage.total_tokens
-        
-        # Log the response
-        logging.info(f"--- LLM Response ---\nContent: {response_content}\nTokens: {total_tokens}\n--------------------")
+        response_content = completion.choices[0].message.content or ""
+        usage = getattr(completion, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None) or getattr(usage, "output_tokens", None)
+        total_tokens = getattr(usage, "total_tokens", None) or (prompt_tokens + completion_tokens if (prompt_tokens is not None and completion_tokens is not None) else None)
+        if total_tokens is None:
+            total_tokens = 0
+
+        # 日志：model、input tokens、output tokens（便于排查与计费）
+        logging.info(
+            f"LLM call | model={selected_model} | input_tokens={prompt_tokens} | output_tokens={completion_tokens} | total_tokens={total_tokens}"
+        )
+        logging.info(f"--- LLM Response ---\nContent: {response_content[:500]}{'...' if len(response_content) > 500 else ''}\n--------------------")
 
         return response_content, total_tokens
     except Exception as e:

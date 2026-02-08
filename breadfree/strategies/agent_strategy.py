@@ -221,57 +221,92 @@ class AgentStrategy(BreadFreeStrategy):
         super().__init__(broker, lot_size)
         self.app = build_graph()
         self.symbol = None
-        self.news_data = [] # Store loaded news
+        self.news_data = []  # 新闻缓存
+        self.volume_history = {}  # {symbol: [volume, ...]} 用于散户情绪
 
     def set_symbols(self, symbols):
         if len(symbols) > 1:
             print("Warning: AgentStrategy currently supports analysis for only one symbol. Using the first one.")
         self.symbol = symbols[0]
-        # 调用基类初始化 history 字典
         super().set_symbols(symbols)
+        for s in symbols:
+            if s not in self.volume_history:
+                self.volume_history[s] = []
         self.load_news()
 
     def load_news(self):
-        """Load news from JSON cache"""
+        """从 JSON 缓存加载新闻；无缓存时保持空，get_news_context 内会尝试实时拉一页补充"""
         try:
-            # Assuming the cache directory is relative to the project root
-            # breadfree/strategies/langgraph_strategy.py -> breadfree/strategies -> breadfree -> data/cache
             base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             cache_dir = os.path.join(base_dir, "data", "cache")
             file_path = os.path.join(cache_dir, f"news_{self.symbol}.json")
-            
             if os.path.exists(file_path):
-                with open(file_path, 'r', encoding='utf-8') as f:
+                with open(file_path, "r", encoding="utf-8") as f:
                     self.news_data = json.load(f)
                 print(f"Loaded {len(self.news_data)} news items for {self.symbol}")
             else:
-                print(f"No news cache found for {self.symbol} at {file_path}")
                 self.news_data = []
         except Exception as e:
             print(f"Error loading news: {e}")
             self.news_data = []
 
+    def _fetch_news_once(self):
+        """无缓存时拉取一页新闻并合并到 self.news_data（仅补一次）"""
+        if self.news_data:
+            return
+        try:
+            from ..data.news_fetcher import NewsFetcher
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            cache_dir = os.path.join(base_dir, "data", "cache")
+            fetcher = NewsFetcher(data_dir=cache_dir)
+            df = fetcher.get_stock_news(self.symbol)
+            if df.empty:
+                return
+            # 统一为 get_news_context 使用的字段名
+            if "发布时间" not in df.columns and "date" in df.columns:
+                df["发布时间"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+            for _, row in df.iterrows():
+                pub = row.get("发布时间", row.get("date", ""))
+                if hasattr(pub, "strftime"):
+                    pub = pd.Timestamp(pub).strftime("%Y-%m-%d %H:%M:%S")
+                self.news_data.append({
+                    "发布时间": str(pub),
+                    "新闻标题": str(row.get("新闻标题", row.get("title", ""))),
+                    "新闻内容": str(row.get("新闻内容", row.get("content", "")))[:500],
+                })
+            if self.news_data:
+                print(f"Fetched {len(self.news_data)} news items for {self.symbol} (on-the-fly)")
+        except Exception as e:
+            print(f"On-the-fly news fetch failed: {e}")
+
     def get_news_context(self, current_date_str, days=2):
-        """Get news context for the past N days relative to current_date"""
+        """过去 N 天的新闻摘要；无缓存时会尝试实时拉一页再过滤"""
+        self._fetch_news_once()
         if not self.news_data:
-            return "暂无相关新闻数据 (未知)"
-            
+            return "暂无相关新闻数据（可预先运行 news_fetcher 拉取并保存到 data/cache/news_<代码>.json）"
         try:
             current_date = pd.to_datetime(current_date_str)
             start_date = current_date - timedelta(days=days)
-            
             relevant_news = []
             for item in self.news_data:
-                news_time = pd.to_datetime(item['发布时间'])
-                # Filter news: start_date <= news_time <= current_date (end of day)
-                if start_date <= news_time <= current_date + timedelta(days=1): 
-                    relevant_news.append(f"- [{item['发布时间']}] {item['新闻标题']} {item['新闻内容'][:200]} ...")
-            
+                t = item.get("发布时间")
+                if not t:
+                    continue
+                news_time = pd.to_datetime(t, errors="coerce")
+                if pd.isna(news_time):
+                    continue
+                if start_date <= news_time <= current_date + timedelta(days=1):
+                    content = (item.get("新闻内容") or "")[:200]
+                    relevant_news.append(f"- [{t}] {item.get('新闻标题', '')} {content} ...")
             if not relevant_news:
-                return "该时段暂无新闻 (未知)"
-                
-            # Return top 10 most recent relevant news
-            return "\n".join(relevant_news[:10]) 
+                # 若无当日段内新闻，返回最近几条作为“近期舆情”参考
+                recent = []
+                for item in self.news_data[:5]:
+                    t = item.get("发布时间", "")
+                    content = (item.get("新闻内容") or "")[:200]
+                    recent.append(f"- [{t}] {item.get('新闻标题', '')} {content} ...")
+                return "该时段无新闻，近期舆情参考:\n" + "\n".join(recent) if recent else "该时段暂无新闻"
+            return "\n".join(relevant_news[:10])
         except Exception as e:
             print(f"Error filtering news: {e}")
             return "新闻数据处理出错"
@@ -280,14 +315,12 @@ class AgentStrategy(BreadFreeStrategy):
         if self.symbol not in bars:
             return
         bar_data = bars[self.symbol]
-
-        # Update history
         if self.symbol not in self.history:
             self.history[self.symbol] = []
-        
-        self.history[self.symbol].append(bar_data['close'])
-        
-        # Run async graph in sync context
+        self.history[self.symbol].append(bar_data["close"])
+        if self.symbol not in self.volume_history:
+            self.volume_history[self.symbol] = []
+        self.volume_history[self.symbol].append(bar_data.get("volume", 0))
         try:
             asyncio.run(self._run_graph(date, bar_data))
         except Exception as e:
@@ -310,15 +343,26 @@ class AgentStrategy(BreadFreeStrategy):
         recent_prices = hist[-5:] if len(hist) >= 5 else hist
         recent_prices_str = ", ".join([f"{p:.2f}" for p in recent_prices])
 
-        # Get Real News Context
         news_context = self.get_news_context(str(date))
-        
-        # Simulated Sentiment (Still simulated for now, or could be derived from volume)
-        # Simple volume based sentiment
-        # Note: self.history only stores close prices, so we can't calculate avg volume easily here 
-        # without storing volume history. For now, we keep it simple or use a placeholder.
-        sentiment = "散户情绪稳定。" # Default
-        
+
+        # 散户情绪：基于量比（当日量/近5日均量）与近期涨跌
+        vol_hist = self.volume_history.get(self.symbol) or []
+        cur_vol = bar_data.get("volume", 0) or 1
+        avg_vol_5 = (sum(vol_hist[-5:]) / 5) if len(vol_hist) >= 5 else cur_vol
+        vol_ratio = cur_vol / avg_vol_5 if avg_vol_5 else 1.0
+        if vol_ratio > 1.2:
+            vol_desc = "交投活跃、情绪升温"
+        elif vol_ratio < 0.8:
+            vol_desc = "观望、情绪谨慎"
+        else:
+            vol_desc = "成交平稳、情绪稳定"
+        if len(hist) >= 5:
+            ret_5 = (hist[-1] - hist[-5]) / hist[-5] if hist[-5] else 0
+            trend = "偏多" if ret_5 > 0.02 else "偏空" if ret_5 < -0.02 else "中性"
+            sentiment = f"量比{vol_ratio:.2f}，{vol_desc}；近5日涨跌{trend}。"
+        else:
+            sentiment = f"量比{vol_ratio:.2f}，{vol_desc}。"
+
         market_data_str = f"""
         Date: {date}
         Close: {bar_data['close']:.2f}
