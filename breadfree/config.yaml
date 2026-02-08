@@ -34,3 +34,24 @@ lot_size: 100
 commission_rate: 0.0003
 data_source: "akshare" # "akshare" or "tushare"
 strategy: "RotationStrategy" # "DoubleMAStrategy" "AgentStrategy" "BenchmarkStrategy" "RotationStrategy"
+
+# LLM 多配置（Agent 策略）：通过 llm.active 切换，API Key 从 .env 中对应 env_key 读取
+llm:
+  active: volcano  # 可选: nvidia | volcano
+  providers:
+    nvidia:
+      base_url: "https://integrate.api.nvidia.com/v1"
+      model: "minimaxai/minimax-m2.1"
+      env_key: NVIDIA_API_KEY
+      agent_models:
+        market_analyst: "qwen/qwq-32b"
+        risk_manager: "minimaxai/minimax-m2.1"
+        fund_manager: "deepseek-ai/deepseek-v3.2"
+    volcano:
+      base_url: "https://ark.cn-beijing.volces.com/api/v3"
+      model: "ep-20251208192433-wsbrk"
+      env_key: ARK_API_KEY
+      agent_models:
+        market_analyst: "ep-20251208192433-wsbrk"
+        risk_manager: "ep-20251208192433-wsbrk"
+        fund_manager: "ep-20251208192433-wsbrk"

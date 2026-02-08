@@ -86,29 +86,65 @@ FUND_MANAGER_PROMPT = """
 注意：不要使用<think>标签进行思考，直接输出纯JSON对象即可。
 """
 
+# --- 从 config 读取当前 provider 下各节点模型（未配置则用该 provider 的 model）---
+_DEFAULT_AGENT_MODELS = {
+    "nvidia": {
+        "market_analyst": "qwen/qwq-32b",
+        "risk_manager": "minimaxai/minimax-m2.1",
+        "fund_manager": "deepseek-ai/deepseek-v3.2",
+    },
+    "volcano": {
+        "market_analyst": "ep-20251208192433-wsbrk",
+        "risk_manager": "ep-20251208192433-wsbrk",
+        "fund_manager": "ep-20251208192433-wsbrk",
+    },
+}
+
+
+def _get_agent_model(node_name: str) -> str | None:
+    """从 config.yaml 的 llm.providers[active].agent_models 读取节点模型，未配置则用该 provider 的 model 或内置默认。"""
+    config_path = os.path.join(os.path.dirname(__file__), "..", "config.yaml")
+    if not os.path.exists(config_path):
+        return (_DEFAULT_AGENT_MODELS.get("volcano") or {}).get(node_name)
+    try:
+        import yaml
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        llm = cfg.get("llm") or {}
+        active = (llm.get("active") or os.environ.get("LLM_PROVIDER") or "volcano").lower()
+        providers = llm.get("providers") or {}
+        spec = providers.get(active) or {}
+        agent_models = spec.get("agent_models") or {}
+        return agent_models.get(node_name) or spec.get("model") or (_DEFAULT_AGENT_MODELS.get(active) or {}).get(node_name)
+    except Exception:
+        return (_DEFAULT_AGENT_MODELS.get("volcano") or {}).get(node_name)
+
+
 # --- Node Functions ---
 
 async def market_analyst_node(state: AgentState):
     logger.info(f"Market Analyst Node Input: {state}")
     query = f"日期: {state['date']}\n市场数据:\n{state['market_data']}"
-    # Market Analyst uses QwQ-32B reasoning model for deep thinking and analysis
+    model = _get_agent_model("market_analyst")
     response, _ = await async_hunyuan_chat(
-        query=query, 
+        query=query,
         prompt=ANALYST_PROMPT,
-        model="qwen/qwq-32b"
+        model=model,
     )
     return {"analyst_view": response}
+
 
 async def risk_manager_node(state: AgentState):
     logger.info(f"Risk Manager Node Input: {state}")
     query = f"日期: {state['date']}\n账户状态:\n{state['account_status']}\n市场分析师观点:\n{state['analyst_view']}"
-    # Risk Manager uses MiniMax-M2.1 for conservative risk assessment
+    model = _get_agent_model("risk_manager")
     response, _ = await async_hunyuan_chat(
-        query=query, 
+        query=query,
         prompt=RISK_MANAGER_PROMPT,
-        model="minimaxai/minimax-m2.1"
+        model=model,
     )
     return {"risk_view": response}
+
 
 async def fund_manager_node(state: AgentState):
     logger.info(f"Fund Manager Node Input: {state}")
@@ -116,17 +152,17 @@ async def fund_manager_node(state: AgentState):
     日期: {state['date']}
     市场分析师观点:
     {state['analyst_view']}
-    
+
     风控官观点:
     {state['risk_view']}
-    
+
     请做出决策。
     """
-    # Fund Manager uses DeepSeek-V3.2 for final decision making
+    model = _get_agent_model("fund_manager")
     response, _ = await async_hunyuan_chat(
-        query=query, 
+        query=query,
         prompt=FUND_MANAGER_PROMPT,
-        model="deepseek-ai/deepseek-v3.2"
+        model=model,
     )
     
     # Import parse function
