@@ -25,8 +25,8 @@ etf_pool:
 # start_date: "20200101"
 # end_date: "20201231"
 
-start_date: "20210101"
-end_date: "20211231"
+start_date: "20250101"
+end_date: "20251231"
 
 initial_cash: 100000.0
 asset_type: "stock"

@@ -1,6 +1,72 @@
 import akshare as ak
 import pandas as pd
 import os
+import time
+import random
+
+# 东方财富 K 线接口（与 akshare 相同），用 curl_cffi 请求可避免 RemoteDisconnected
+_EM_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+_EM_KLINE_PARAMS = {
+    "fields1": "f1,f2,f3,f4,f5,f6",
+    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116",
+    "ut": "7eea3edcaed734bea9cbfc24409ed989",
+    "klt": "101",
+    "fqt": "1",
+}
+
+
+def _fetch_em_kline_curl(symbol: str, start_date: str, end_date: str, is_etf: bool, adjust: str = "qfq") -> pd.DataFrame:
+    """用 curl_cffi 请求东方财富 K 线，避免 requests 被断连。返回与 akshare 同结构的 DataFrame。"""
+    try:
+        from curl_cffi import requests as cffi_req
+    except ImportError:
+        return pd.DataFrame()
+    fqt = "1" if adjust == "qfq" else ("2" if adjust == "hfq" else "0")
+    if is_etf:
+        market_id = 1 if symbol.startswith(("5", "6")) else 0
+    else:
+        market_id = 1 if symbol.startswith("6") else 0
+    params = {
+        **_EM_KLINE_PARAMS,
+        "fqt": fqt,
+        "beg": start_date,
+        "end": end_date,
+        "secid": f"{market_id}.{symbol}",
+    }
+    try:
+        r = cffi_req.get(_EM_KLINE_URL, params=params, timeout=20, impersonate="chrome")
+        data = r.json()
+    except Exception:
+        return pd.DataFrame()
+    if not (data.get("data") and data["data"].get("klines")):
+        return pd.DataFrame()
+    rows = [item.split(",") for item in data["data"]["klines"]]
+    df = pd.DataFrame(
+        rows,
+        columns=["日期", "开盘", "收盘", "最高", "最低", "成交量", "成交额", "振幅", "涨跌幅", "涨跌额", "换手率"],
+    )
+    df.rename(
+        columns={
+            "日期": "date",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
+            "成交额": "amount",
+            "振幅": "amplitude",
+            "涨跌幅": "pct_chg",
+            "涨跌额": "change",
+            "换手率": "turnover",
+        },
+        inplace=True,
+    )
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df.set_index("date", inplace=True)
+    for col in ["open", "close", "high", "low", "volume", "amount", "amplitude", "pct_chg", "change", "turnover"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
 
 class DataFetcher:
     def __init__(self, data_dir="data_cache", data_source="akshare", tushare_token=None):
@@ -166,43 +232,44 @@ class DataFetcher:
         return df
 
     def _fetch_from_akshare(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-        print(f"Fetching data for {symbol} from AkShare...")
-        try:
-            # 检查是否为ETF（以5或1开头）
-            if symbol.startswith(('5', '1')):
-                # 使用ETF接口
-                df = ak.fund_etf_hist_em(symbol=symbol, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
-            else:
-                # 使用A股接口
-                df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
-            
-            if df.empty:
-                print("Warning: No data fetched.")
-                return pd.DataFrame()
-
-            # 重命名列以符合通用习惯
-            df.rename(columns={
-                '日期': 'date',
-                '开盘': 'open',
-                '收盘': 'close',
-                '最高': 'high',
-                '最低': 'low',
-                '成交量': 'volume',
-                '成交额': 'amount',
-                '振幅': 'amplitude',
-                '涨跌幅': 'pct_chg',
-                '涨跌额': 'change',
-                '换手率': 'turnover'
-            }, inplace=True)
-            
-            df['date'] = pd.to_datetime(df['date'])
-            df.set_index('date', inplace=True)
-            
+        # 优先用 curl_cffi 直连东方财富 K 线接口（模拟浏览器，减少 RemoteDisconnected）
+        time.sleep(3 + random.uniform(0, 2))
+        is_etf = symbol.startswith(("5", "1"))
+        df = _fetch_em_kline_curl(symbol, start_date, end_date, is_etf=is_etf, adjust="qfq")
+        if not df.empty:
+            print(f"Fetched data for {symbol} via curl_cffi (East Money).")
             return df
-            
-        except Exception as e:
-            print(f"Error fetching data from AkShare: {e}")
-            return pd.DataFrame()
+
+        # 回退到 akshare，并做重试
+        max_retries = 3
+        retry_delays = (8, 20, 45)
+        for attempt in range(max_retries):
+            if attempt > 0:
+                wait = retry_delays[min(attempt - 1, len(retry_delays) - 1)] + random.uniform(0, 3)
+                print(f"Retry {attempt}/{max_retries - 1} after {wait:.1f}s...")
+                time.sleep(wait)
+
+            print(f"Fetching data for {symbol} from AkShare...")
+            try:
+                if is_etf:
+                    df = ak.fund_etf_hist_em(symbol=symbol, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
+                else:
+                    df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
+                if df.empty:
+                    return pd.DataFrame()
+                df.rename(columns={
+                    "日期": "date", "开盘": "open", "收盘": "close", "最高": "high", "最低": "low",
+                    "成交量": "volume", "成交额": "amount", "振幅": "amplitude", "涨跌幅": "pct_chg",
+                    "涨跌额": "change", "换手率": "turnover",
+                }, inplace=True)
+                df["date"] = pd.to_datetime(df["date"])
+                df.set_index("date", inplace=True)
+                return df
+            except Exception as e:
+                print(f"Error fetching data from AkShare: {e}")
+                if attempt == max_retries - 1:
+                    return pd.DataFrame()
+        return pd.DataFrame()
 
 if __name__ == "__main__":
     path = os.path.join(os.path.dirname(__file__), "cache/top_150_with_sectors.csv")

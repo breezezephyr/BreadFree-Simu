@@ -1,3 +1,9 @@
+[tool.uv]
+# 中国区加速：优先使用清华镜像，找不到时回退 PyPI
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
 [project]
 name = "breadfree"
 version = "0.1.0"
