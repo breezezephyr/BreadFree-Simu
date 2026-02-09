@@ -61,6 +61,15 @@ scheduler:
   post_market_time: "15:05"
   nightly_time: "21:00"
 
+# Alert configuration
+alert:
+  enabled: true
+  min_level: "WARNING"           # INFO / WARNING / CRITICAL
+  rate_limit_per_min: 20
+  # Uncomment to enable push notifications:
+  # wechat_webhook: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY"
+  # dingtalk_webhook: "https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN"
+
 # Data source
 data_source: akshare
 lot_size: 100

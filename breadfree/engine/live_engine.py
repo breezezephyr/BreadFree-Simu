@@ -39,6 +39,8 @@ from ..gateway.base_gateway import BaseGateway, BarData, GatewayStatus
 from ..data.data_fetcher import DataFetcher
 from ..data.database import get_db_manager
 from ..data.live_store import LiveTradeStore
+from ..monitor.alert_manager import AlertManager, AlertLevel
+from ..monitor.audit_logger import AuditLogger
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -95,6 +97,11 @@ class LiveEngine:
         db_path = config.get("live_db_path", "live_trading.db")
         self.store = LiveTradeStore(db_path)
 
+        # ── Monitoring ──
+        alert_config = config.get("alert", {})
+        self.alert_manager = AlertManager(alert_config)
+        self.audit = AuditLogger(db_path)
+
         # ── State ──
         self._latest_bars: Dict[str, dict] = {}
         self._is_running = False
@@ -143,9 +150,11 @@ class LiveEngine:
             self.gateway.register_on_bar(self._on_bar_received)
             self.gateway.register_on_error(self._on_gateway_error)
 
-        # Register event bus listeners for persistence
+        # Register event bus listeners for persistence + audit
         self.event_bus.subscribe(EventType.ORDER, self._persist_order)
         self.event_bus.subscribe(EventType.TRADE, self._persist_trade)
+        self.event_bus.subscribe(EventType.ORDER, self._audit_order)
+        self.event_bus.subscribe(EventType.TRADE, self._audit_trade)
 
     def _create_gateway(self) -> BaseGateway:
         """Create gateway based on config."""
@@ -218,11 +227,18 @@ class LiveEngine:
         """
         logger.info("[LiveEngine] Starting...")
         self._is_running = True
+        self.audit.log_system_event("START", f"LiveEngine starting: "
+                                    f"gateway={self.config.get('gateway', {}).get('type', 'simulated')}, "
+                                    f"strategy={self.config.get('strategy', {}).get('name', '?')}")
 
         # Connect gateway
         if self.gateway and not self.gateway.is_connected:
             if not self.gateway.connect():
                 logger.error("[LiveEngine] Gateway connection failed. Aborting.")
+                self.alert_manager.send_critical("Gateway connection failed at startup!")
+                self.audit.log_gateway_event(
+                    self.gateway.gateway_name, "CONNECT_FAIL",
+                    "Connection failed at startup", level="ERROR")
                 return
 
         # Subscribe market data
@@ -247,6 +263,7 @@ class LiveEngine:
         """Gracefully stop the engine."""
         logger.info("[LiveEngine] Stopping...")
         self._is_running = False
+        self.audit.log_system_event("STOP", "LiveEngine stopping")
 
         if self.scheduler:
             self.scheduler.stop()
@@ -297,8 +314,15 @@ class LiveEngine:
             logger.info(f"[LiveEngine] Running strategy with {len(bars)} symbols...")
             self.strategy.on_bar(now, bars)
             logger.info("[LiveEngine] Strategy execution completed")
+            self.audit.log_strategy_decision(
+                self.strategy.__class__.__name__,
+                signals=[],
+                reasoning=f"Triggered at {now.strftime('%H:%M:%S')} with {len(bars)} symbols",
+            )
         except Exception as e:
             logger.error(f"[LiveEngine] Strategy execution failed: {e}", exc_info=True)
+            self.alert_manager.send_critical(f"Strategy execution failed: {e}")
+            self.audit.log_system_event("STRATEGY_ERROR", str(e), level="ERROR")
 
         # Publish event
         self.event_bus.publish(Event(
@@ -355,6 +379,22 @@ class LiveEngine:
         except Exception as e:
             logger.error(f"[LiveEngine] Failed to save engine state: {e}")
 
+        # Send daily summary alert
+        try:
+            account_info = {
+                "total_equity": account.total_equity if account else 0,
+                "available_cash": account.available_cash if account else 0,
+                "total_pnl": account.total_pnl if account else 0,
+            }
+            today_trades = self.store.get_today_trades(today)
+            risk_stats = self.risk_manager.get_stats() if self.risk_manager else {}
+            self.alert_manager.send_daily_summary(account_info, today_trades, risk_stats)
+        except Exception as e:
+            logger.error(f"[LiveEngine] Failed to send daily summary: {e}")
+
+        self.audit.log_system_event("POST_MARKET", f"EOD completed: "
+                                    f"equity={account.total_equity:.2f}" if account else "no account data")
+
     def _on_nightly(self):
         """Nightly job: update data, generate reports."""
         logger.info("[LiveEngine] Nightly job phase")
@@ -383,6 +423,37 @@ class LiveEngine:
             logger.error(f"[LiveEngine] Failed to persist trade: {e}")
 
     # ──────────────────────────────────────────
+    # Audit callbacks
+    # ──────────────────────────────────────────
+
+    def _audit_order(self, event: Event):
+        """Write order event to audit log + send alerts for rejections."""
+        try:
+            order = event.data
+            if isinstance(order, Order):
+                self.audit.log_order(order)
+                # Alert on rejected orders
+                if order.status.value == "REJECTED":
+                    self.alert_manager.send_order_alert({
+                        "status": order.status.value,
+                        "symbol": order.symbol,
+                        "direction": order.direction.value,
+                        "quantity": order.quantity,
+                        "reject_reason": order.reject_reason,
+                    })
+        except Exception as e:
+            logger.error(f"[LiveEngine] Audit order failed: {e}")
+
+    def _audit_trade(self, event: Event):
+        """Write trade event to audit log."""
+        try:
+            trade = event.data
+            if isinstance(trade, Trade):
+                self.audit.log_trade(trade)
+        except Exception as e:
+            logger.error(f"[LiveEngine] Audit trade failed: {e}")
+
+    # ──────────────────────────────────────────
     # Data handling
     # ──────────────────────────────────────────
 
@@ -393,6 +464,10 @@ class LiveEngine:
     def _on_gateway_error(self, error_msg: str):
         """Callback when gateway reports an error."""
         logger.error(f"[LiveEngine] Gateway error: {error_msg}")
+        self.alert_manager.send_warning(f"Gateway error: {error_msg}")
+        self.audit.log_gateway_event(
+            self.gateway.gateway_name if self.gateway else "unknown",
+            "ERROR", error_msg, level="ERROR")
 
     def _collect_latest_bars(self) -> Dict[str, dict]:
         """
