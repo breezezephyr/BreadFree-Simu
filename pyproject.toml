@@ -28,4 +28,13 @@ dependencies = [
     "sqlalchemy>=2.0.0",
     "alembic>=1.13.0",
     "scikit-learn>=1.8.0",
+    # Phase 2+: 实盘交易 & 调度
+    "schedule>=1.2.0",
+    "streamlit>=1.45.0",
 ]
+
+[project.optional-dependencies]
+# 券商网关（按需安装，避免强制依赖平台特定包）
+futu = ["futu-api>=9.1.0"]
+qmt = ["xtquant>=0.0.1"]
+live = ["futu-api>=9.1.0", "xtquant>=0.0.1"]
