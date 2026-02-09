@@ -128,7 +128,7 @@ class RiskManager:
             existing_value = 0
             if signal.symbol in broker.positions:
                 pos = broker.positions[signal.symbol]
-                existing_value = pos.quantity * price
+                existing_value = pos.quantity * pos.avg_price
             new_position_pct = (existing_value + buy_value) / total_equity
             if new_position_pct > self.max_position_pct:
                 self.rejected_count += 1

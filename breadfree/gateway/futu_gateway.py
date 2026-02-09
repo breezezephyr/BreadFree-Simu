@@ -226,12 +226,17 @@ class FutuGateway(BaseGateway):
         )
 
         if ret == futu.RET_OK:
-            futu_order_id = str(data['order_id'].iloc[0])
-            self._order_id_map[request.order_id] = futu_order_id
-            logger.info(f"[Futu] Order placed: {request.symbol} "
-                       f"{request.direction.value} {request.quantity} "
-                       f"@ {price} -> futu_id={futu_order_id}")
-            return futu_order_id
+            if not data.empty:
+                futu_order_id = str(data['order_id'].iloc[0])
+                self._order_id_map[request.order_id] = futu_order_id
+                logger.info(f"[Futu] Order placed: {request.symbol} "
+                           f"{request.direction.value} {request.quantity} "
+                           f"@ {price} -> futu_id={futu_order_id}")
+                return futu_order_id
+            else:
+                logger.warning(f"[Futu] Order placed but response data is empty: "
+                             f"{request.symbol} {request.direction.value} {request.quantity}")
+                return request.order_id
         else:
             logger.error(f"[Futu] Order failed: {data}")
             return ""

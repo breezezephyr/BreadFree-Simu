@@ -109,9 +109,3 @@
 我是一名资深的 Python 开发者，也在 AI 研发领域摸爬滚打过几年，但在量化交易上，我还是个不折不扣的新手。
 
 **BreadFree** 项目更多是我作为一个技术人，对自己想法落地的一次探索与开源实践。如果你有好的想法、数据源推荐或者策略建议，**请务必在评论区提出来**。我会持续将实现的代码开源，供大家参考和魔改。不对的地方，也欢迎随时拍砖指正。
-
-
----
-
-*BreadFree 项目地址：[github.com/FeiCoder/BreadFree-Simu](https://github.com/FeiCoder/BreadFree-Simu)*
-*本文数据基于 BreadFree 项目 `grid_search.sh` 在 2020-2025 数据集上的真实跑测结果。*
