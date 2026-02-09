@@ -1,3 +1,6 @@
+from .broker_adapter import BrokerAdapter
+
+
 class Position:
     def __init__(self, symbol, quantity, avg_price):
         self.symbol = symbol
@@ -9,17 +12,59 @@ class Position:
     def __repr__(self):
         return f"Position({self.symbol}, {self.quantity}, {self.avg_price:.2f})"
 
-class Broker:
+
+class Broker(BrokerAdapter):
+    """
+    Simulated broker for backtesting.
+
+    Implements BrokerAdapter interface while preserving all existing behavior.
+    Orders are filled instantly at the given price (no order book simulation).
+    """
+
     def __init__(self, initial_cash=100000.0, commission_rate=0.0003):
-        self.initial_cash = initial_cash # 初始资金
-        self.cash = initial_cash # 当前可用资金
-        self.positions = {} # symbol -> Position
-        self.commission_rate = commission_rate
+        self._initial_cash = initial_cash   # 初始资金
+        self._cash = initial_cash           # 当前可用资金
+        self._positions = {}                # symbol -> Position
+        self._commission_rate = commission_rate
         self.transaction_history = []
-        self.equity_curve = [] # 记录每日权益变化
-        self.current_equity = initial_cash # 当前总权益（现金 + 持仓市值）
+        self.equity_curve = []              # 记录每日权益变化
+        self.current_equity = initial_cash  # 当前总权益（现金 + 持仓市值）
         # 新增：记录已平仓的交易盈亏，用于计算胜率
         self.closed_trades = [] # List of {'symbol', 'buy_date', 'sell_date', 'buy_price', 'sell_price', 'quantity', 'pnl', 'return_pct'}
+
+    # ── BrokerAdapter abstract properties ──
+
+    @property
+    def cash(self) -> float:
+        return self._cash
+
+    @cash.setter
+    def cash(self, value: float):
+        self._cash = value
+
+    @property
+    def positions(self) -> dict:
+        return self._positions
+
+    @positions.setter
+    def positions(self, value: dict):
+        self._positions = value
+
+    @property
+    def commission_rate(self) -> float:
+        return self._commission_rate
+
+    @commission_rate.setter
+    def commission_rate(self, value: float):
+        self._commission_rate = value
+
+    @property
+    def initial_cash(self) -> float:
+        return self._initial_cash
+
+    @initial_cash.setter
+    def initial_cash(self, value: float):
+        self._initial_cash = value
 
     def buy(self, date, symbol, price, quantity):
         cost = price * quantity
