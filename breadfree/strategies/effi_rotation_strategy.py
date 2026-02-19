@@ -196,27 +196,33 @@ class RotationStrategy(BreadFreeStrategy):
                 buy_value = min(value_diff, max_buy_value)
                 
                 # Calculate quantity with lot size
-                buy_qty = int(buy_value // price)
-                buy_qty = (buy_qty // self.lot_size) * self.lot_size
-                
-                if buy_qty > 0:
-                    self.broker.buy(date, symbol, price, buy_qty)
-                    logger.info(f"Buying {symbol}: {buy_qty} shares @ {price} (Target weight: {target_weights[symbol]:.2%})")
-                    self.trade_counter += 1
+                if price > 0:
+                    buy_qty = int(buy_value // price)
+                    buy_qty = (buy_qty // self.lot_size) * self.lot_size
+                    
+                    if buy_qty > 0:
+                        self.broker.buy(date, symbol, price, buy_qty)
+                        logger.info(f"Buying {symbol}: {buy_qty} shares @ {price} (Target weight: {target_weights[symbol]:.2%})")
+                        self.trade_counter += 1
+                else:
+                    logger.warning(f"Cannot buy {symbol} (Price is zero or negative: {price})")
             
             # Sell logic (reduction)
             elif value_diff < 0:
                 sell_value = -value_diff
-                sell_qty = int(sell_value // price)
-                if symbol in self.broker.positions:
-                    current_qty = self.broker.positions[symbol].quantity
-                    sell_qty = min(sell_qty, current_qty)
-                    sell_qty = (sell_qty // self.lot_size) * self.lot_size
-                    
-                    if sell_qty > 0:
-                        self.broker.sell(date, symbol, price, sell_qty)
-                        logger.info(f"Reducing position {symbol}: {sell_qty} shares (Target weight: {target_weights[symbol]:.2%})")
-                        self.trade_counter += 1
+                if price > 0:
+                    sell_qty = int(sell_value // price)
+                    if symbol in self.broker.positions:
+                        current_qty = self.broker.positions[symbol].quantity
+                        sell_qty = min(sell_qty, current_qty)
+                        sell_qty = (sell_qty // self.lot_size) * self.lot_size
+                        
+                        if sell_qty > 0:
+                            self.broker.sell(date, symbol, price, sell_qty)
+                            logger.info(f"Reducing position {symbol}: {sell_qty} shares (Target weight: {target_weights[symbol]:.2%})")
+                            self.trade_counter += 1
+                else:
+                    logger.warning(f"Cannot sell {symbol} (Price is zero or negative: {price})")
 
     def on_bar(self, date, bars):
         # 1. Update data and handle suspensions

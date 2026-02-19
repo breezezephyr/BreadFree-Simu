@@ -277,7 +277,10 @@ class TripleMomentumStrategy(BreadFreeStrategy):
                     available_cash = self.broker.cash
                     price = bars[target_symbol]['close']
                     # 考虑预留一点给手续费
-                    qty = int(available_cash / (price * (1+self.broker.commission_rate)) // self.lot_size) * self.lot_size
-                    
-                    if qty > 0:
-                        self.broker.buy(date, target_symbol, price, qty)
+                    if price > 0:
+                        qty = int(available_cash / (price * (1+self.broker.commission_rate)) // self.lot_size) * self.lot_size
+                        
+                        if qty > 0:
+                            self.broker.buy(date, target_symbol, price, qty)
+                    else:
+                        logger.warning(f"Cannot buy {target_symbol} (Price is zero or negative: {price})")
