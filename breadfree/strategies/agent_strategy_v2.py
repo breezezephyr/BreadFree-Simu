@@ -30,8 +30,32 @@ from ..utils.llm_client import async_hunyuan_chat, parse_llm_response
 from ..utils.metrics import calculate_efficiency_metrics, stable_linear_regression
 from ..utils.portfolio import normalize_weights
 from ..utils.logger import get_logger
+from ..data.market_intel import MarketIntel
 
 logger = get_logger(__name__)
+
+_intel = MarketIntel()
+
+
+def _load_etf_names() -> Dict[str, str]:
+    """从 config.yaml 加载 ETF 代码→中文名称映射"""
+    config_path = os.path.join(os.path.dirname(__file__), "..", "config.yaml")
+    try:
+        import yaml
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        return cfg.get("etf_pool", {})
+    except Exception:
+        return {}
+
+
+_ETF_NAMES: Dict[str, str] = _load_etf_names()
+
+
+def _n(symbol: str) -> str:
+    """代码 → '代码-中文名' 格式，如 '510300-沪深300ETF'"""
+    name = _ETF_NAMES.get(symbol, "")
+    return f"{symbol}-{name}" if name else symbol
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -109,6 +133,9 @@ BULL_ANALYST_PROMPT = """\
 【量化指标（近{lookback}日）】
 {metrics_table}
 
+【市场情报】
+{market_intel}
+
 【市场政权】{regime}
 【当前持仓】{holdings}
 【上期回顾】{last_context}
@@ -138,10 +165,14 @@ BEAR_CHALLENGER_PROMPT = """\
 【量化数据】
 {metrics_table}
 
+【市场情报】
+{market_intel}
+
 【你的审查框架】
 1. 集中度风险：单一资产 > 80% 时，检查其 R² 是否 > 0.75 且动量加速度 > 0
 2. 趋势衰退：动量加速度 < 0 的资产是否被过度配置
 3. 波动率异常：日波动率 > 2% 的资产需要额外风险溢价
+4. 资金面验证：Bull重仓的ETF是否有主力资金流入支撑？北向资金方向与配置方向一致吗？
 4. 持仓惯性：是否因为"已经持有"而忽略了更优选择
 
 【重要原则】
@@ -204,6 +235,7 @@ class V2State(TypedDict):
     top_n: int
     last_decision_context: str
     metrics_table_str: str
+    market_intel_str: str
     bull_output: Dict[str, Any]
     bear_output: Dict[str, Any]
     pm_output: Dict[str, Any]
@@ -247,9 +279,7 @@ def quant_engine_node(state: V2State) -> dict:
 
     valid = {s: m for s, m in all_metrics.items() if s in bars}
     if not valid:
-        return {"top_candidates": [], "regime": "unknown", "metrics_table_str": ""}
-
-    regime = classify_regime(valid)
+        return {"top_candidates": [], "regime": "unknown", "metrics_table_str": "", "market_intel_str": ""}
 
     sorted_syms = sorted(valid, key=lambda s: valid[s]["efficiency"], reverse=True)
     candidates = sorted_syms[:max(top_n + 2, 5)]
@@ -263,15 +293,21 @@ def quant_engine_node(state: V2State) -> dict:
         tag = f" ★持仓{holdings[sym]}股" if sym in holdings else ""
         rank = sorted_syms.index(sym) + 1 if sym in sorted_syms else "?"
         lines.append(
-            f"  #{rank} {sym}: 效率={m['efficiency']:.2f}, "
+            f"  #{rank} {_n(sym)}: 效率={m['efficiency']:.2f}, "
             f"动量={m['momentum']:.2%}, 加速度={m['momentum_accel']:+.2%}, "
             f"R²={m['r2']:.2f}, 波动={m['volatility']:.2%}, "
             f"离高点={m['drawdown_from_high']:.2%}{tag}"
         )
     table_str = "\n".join(lines)
 
-    logger.info(f"[Quant] regime={regime} top={sorted_syms[:top_n]}\n{table_str}")
-    return {"top_candidates": candidates, "regime": regime, "metrics_table_str": table_str}
+    date_ts = pd.Timestamp(state.get("date", ""))
+    regime = _intel.get_regime_enhanced(date_ts, valid)
+    intel_str = _intel.generate_intel_summary(date_ts, valid, candidates[:top_n])
+
+    top_named = [_n(s) for s in sorted_syms[:top_n]]
+    logger.info(f"[Quant] regime={regime} top={top_named}\n{table_str}\n{intel_str}")
+    return {"top_candidates": candidates, "regime": regime,
+            "metrics_table_str": table_str, "market_intel_str": intel_str}
 
 
 # ── Node 2: Bull Analyst (LLM) ──
@@ -283,6 +319,7 @@ async def bull_node(state: V2State) -> dict:
     prompt = BULL_ANALYST_PROMPT.format(
         lookback=state.get("lookback", 20),
         metrics_table=state["metrics_table_str"],
+        market_intel=state.get("market_intel_str", "暂无"),
         regime=state["regime"],
         holdings=state.get("current_holdings") or "无",
         last_context=state.get("last_decision_context") or "首次",
@@ -320,7 +357,8 @@ async def bull_node(state: V2State) -> dict:
                           "error": str(e), "used_fallback": True})
 
     w = {s: v.get("weight", 0) if isinstance(v, dict) else 0 for s, v in result.get("allocations", {}).items()}
-    logger.info(f"[Bull] Proposed: {w}")
+    w_named = {_n(s): v for s, v in w.items()}
+    logger.info(f"[Bull] Proposed: {w_named}")
     return {"bull_output": result, "llm_calls": llm_calls}
 
 
@@ -336,6 +374,7 @@ async def bear_node(state: V2State) -> dict:
     prompt = BEAR_CHALLENGER_PROMPT.format(
         bull_proposal=json.dumps(allocs, ensure_ascii=False),
         metrics_table=state["metrics_table_str"],
+        market_intel=state.get("market_intel_str", "暂无"),
     )
 
     bull_weights = {s: v.get("weight", 0) if isinstance(v, dict) else 0 for s, v in allocs.items()}
@@ -364,8 +403,8 @@ async def bear_node(state: V2State) -> dict:
 
     challenges = result.get("challenges", [])
     agrees = result.get("agrees_with_bull", True)
-    logger.info(f"[Bear] agrees={agrees}, challenges={len(challenges)}, "
-                f"adjusted={result.get('adjusted_weights', {})}")
+    adj_named = {_n(s): v for s, v in result.get("adjusted_weights", {}).items()}
+    logger.info(f"[Bear] agrees={agrees}, challenges={len(challenges)}, adjusted={adj_named}")
     return {"bear_output": result, "llm_calls": llm_calls}
 
 
@@ -389,7 +428,8 @@ async def pm_node(state: V2State) -> dict:
         if total > 0.98:
             scale = 0.95 / total
             tw = {k: round(v * scale, 4) for k, v in tw.items()}
-        logger.info(f"[PM] Bull/Bear consensus → direct approve: {tw}")
+        tw_named = {_n(s): v for s, v in tw.items()}
+        logger.info(f"[PM] Bull/Bear consensus → direct approve: {tw_named}")
         return {"pm_output": {"final_weights": tw, "reasoning": "bull_bear_consensus"},
                 "target_weights": tw, "llm_calls": state.get("llm_calls", [])}
 
@@ -432,7 +472,8 @@ async def pm_node(state: V2State) -> dict:
         tw = {k: round(v * scale, 4) for k, v in tw.items()}
     tw = {k: v for k, v in tw.items() if v >= 0.03}
 
-    logger.info(f"[PM] Final: {tw} | bull={result.get('bull_score')}/bear={result.get('bear_score')}")
+    tw_named = {_n(s): v for s, v in tw.items()}
+    logger.info(f"[PM] Final: {tw_named} | bull={result.get('bull_score')}/bear={result.get('bear_score')}")
     return {"pm_output": result, "target_weights": tw, "llm_calls": llm_calls}
 
 
@@ -527,6 +568,7 @@ class AgentStrategyV2(BreadFreeStrategy):
             "top_n": self.top_n,
             "last_decision_context": self.last_decision_context,
             "metrics_table_str": "",
+            "market_intel_str": "",
             "bull_output": {},
             "bear_output": {},
             "pm_output": {},
@@ -534,7 +576,8 @@ class AgentStrategyV2(BreadFreeStrategy):
             "llm_calls": [],
         }
 
-        logger.info(f"\n{'='*55}\n[V2] {date} 调仓 | 资产¥{total_equity:,.0f} | 持仓{list(pos_snapshot.keys())}")
+        holdings_named = [_n(s) for s in pos_snapshot.keys()]
+        logger.info(f"\n{'='*55}\n[V2] {date} 调仓 | 资产¥{total_equity:,.0f} | 持仓{holdings_named}")
 
         target_weights = {}
         try:
@@ -579,7 +622,8 @@ class AgentStrategyV2(BreadFreeStrategy):
     def _execute_trades(self, date, tw: Dict[str, float], bars, total_equity: float):
         if not tw:
             return
-        logger.info(f"[EXEC] {tw}")
+        tw_named = {_n(s): v for s, v in tw.items()}
+        logger.info(f"[EXEC] {tw_named}")
         cr = self.broker.commission_rate
 
         for symbol in list(self.broker.positions.keys()):
@@ -593,7 +637,7 @@ class AgentStrategyV2(BreadFreeStrategy):
                     price = float(price.iloc[0]) if not price.empty else 0
                 if qty > 0 and price > 0:
                     self.broker.sell(date, symbol, price, qty)
-                    logger.info(f"  SELL ALL {symbol}: {qty}")
+                    logger.info(f"  SELL ALL {_n(symbol)}: {qty}股")
 
         for symbol in list(self.broker.positions.keys()):
             w = tw.get(symbol, 0)
@@ -613,7 +657,7 @@ class AgentStrategyV2(BreadFreeStrategy):
                 sell_q = ((cur_qty - target_qty) // self.lot_size) * self.lot_size
                 if sell_q > 0:
                     self.broker.sell(date, symbol, price, sell_q)
-                    logger.info(f"  REDUCE {symbol}: -{sell_q}")
+                    logger.info(f"  REDUCE {_n(symbol)}: -{sell_q}股")
 
         cash = self.broker.cash
         for symbol, weight in sorted(tw.items(), key=lambda x: -x[1]):
@@ -636,4 +680,4 @@ class AgentStrategyV2(BreadFreeStrategy):
                 if buy_qty > 0 and cost <= cash:
                     self.broker.buy(date, symbol, price, buy_qty)
                     cash -= cost
-                    logger.info(f"  BUY {symbol}: +{buy_qty}")
+                    logger.info(f"  BUY {_n(symbol)}: +{buy_qty}股")
