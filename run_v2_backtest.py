@@ -9,7 +9,6 @@ import pandas as pd, yaml
 from breadfree.engine.backtest_engine import BacktestEngine
 from breadfree.strategies.benchmark_strategy import BenchmarkStrategy
 from breadfree.strategies.effi_rotation_strategy import RotationStrategy
-from breadfree.strategies.agent_strategy import AgentStrategy
 from breadfree.strategies.agent_strategy_v2 import AgentStrategyV2
 from breadfree.strategies.effi_agent_strategy import EffiAgentRotationStrategy
 from breadfree.utils.metrics import (
@@ -71,7 +70,7 @@ def main():
                 lookback_period=20, hold_period=20, top_n=3, use_efficiency=True)
         if r: results.append(r)
 
-        r = run(AgentStrategyV2, syms, sd, ed, cash, ds, f"AgentV2(LLM投委会v2) [{plabel}]",
+        r = run(AgentStrategyV2, syms, sd, ed, cash, ds, f"AgentV2(Bull-Bear辩证) [{plabel}]",
                 lookback_period=20, hold_period=20, top_n=3)
         if r: results.append(r)
 
