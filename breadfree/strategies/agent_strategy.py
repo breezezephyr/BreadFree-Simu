@@ -416,7 +416,7 @@ class AgentStrategy(BreadFreeStrategy):
             if action == "BUY":
                 available_cash = self.broker.cash
                 target_cash = available_cash * quantity_pct
-                if target_cash > 0:
+                if target_cash > 0 and close_price > 0:
                     # 先按目标资金计算最多可买入的股数（未考虑整手）
                     max_shares = int(target_cash / (close_price * (1 + self.broker.commission_rate)))
                     quantity = (max_shares // self.lot_size) * self.lot_size
@@ -433,16 +433,17 @@ class AgentStrategy(BreadFreeStrategy):
 
                     if quantity > 0:
                         self.broker.buy(date, self.symbol, close_price, quantity)
+                elif close_price <= 0:
+                    print(f"[{date}] Warning: Invalid close price for {self.symbol}: {close_price}. Skipping buy.")
             
             elif action == "SELL":
-                if self.symbol in self.broker.positions:
+                if self.symbol in self.broker.positions and close_price > 0:
                     pos = self.broker.positions[self.symbol]
                     quantity = int(pos.quantity * quantity_pct)
                     quantity = (quantity // self.lot_size) * self.lot_size
 
                     # 边界处理：当计算结果为0但持仓小于整手时，允许清仓卖出（全部持仓），或当quantity_pct>0且pos.quantity>=lot_size但四舍五入为0时，提示原因
                     if quantity == 0:
-                        # 如果持仓少于一手但用户希望卖出，允许全部卖出
                         if pos.quantity > 0 and pos.quantity < self.lot_size:
                             quantity = pos.quantity
                             print(f"[{date}] Info: holding less than one lot ({pos.quantity}), selling entire position.")
@@ -451,6 +452,8 @@ class AgentStrategy(BreadFreeStrategy):
 
                     if quantity > 0:
                         self.broker.sell(date, self.symbol, close_price, quantity)
+                elif close_price <= 0:
+                    print(f"[{date}] Warning: Invalid close price for {self.symbol}: {close_price}. Skipping sell.")
 
         except json.JSONDecodeError:
             print(f"[{date}] Failed to parse JSON decision: {result['final_decision']}")

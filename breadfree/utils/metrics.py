@@ -76,7 +76,7 @@ def calculate_calmar_ratio(annual_return: float, max_drawdown: float, risk_free_
     """
     Calculate Calmar ratio (Annual Return / Max Drawdown)
     :param annual_return: Annualized return
-    :param max_drawdown: Maximum drawdown (absolute value, positive)
+    :param max_drawdown: Maximum drawdown (negative value)
     :param risk_free_rate: Risk-free rate
     :return: Calmar ratio
     """
@@ -409,7 +409,7 @@ def calculate_all_metrics(equity_series: pd.Series,
     if not daily_returns.empty:
         metrics['sharpe_ratio'] = calculate_sharpe_ratio(equity_series, risk_free_rate, annual_days)
         metrics['sortino_ratio'] = calculate_sortino_ratio(equity_series, risk_free_rate, annual_days)
-        metrics['calmar_ratio'] = calculate_calmar_ratio(equity_series, risk_free_rate, annual_days)
+        metrics['calmar_ratio'] = calculate_calmar_ratio(metrics['annualized_return'], metrics['max_drawdown'], risk_free_rate)
         metrics['volatility'] = calculate_volatility(daily_returns, annual_days)
         
         # Distribution characteristics

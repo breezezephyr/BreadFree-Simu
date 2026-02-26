@@ -142,7 +142,7 @@ class BacktestEngine:
         profit_loss_ratio = calculate_profit_loss_ratio(trade_returns)
         win_rate, win_count, total_trades = calculate_win_rate(trade_returns)
         # calculate_calmar_ratio
-        calmar_ratio = calculate_calmar_ratio(annualized_return, abs(max_drawdown), risk_free_rate=0.015)
+        calmar_ratio = calculate_calmar_ratio(annualized_return, max_drawdown, risk_free_rate=0.015)
 
         print(f"Backtest finished.")
         print(f"Final Equity: {final_equity:.2f}")
