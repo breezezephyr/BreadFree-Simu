@@ -1,0 +1,60 @@
+symbol: "588000"
+etf_pool:
+  "510300": "沪深300ETF"      # 大盘基准
+  "510500": "中证500ETF"      # 中小盘
+  "159915": "创业板ETF"       # 成长风格
+  "512880": "证券ETF"         # 强周期
+  "510880": "红利ETF"         # 防御价值
+  "513100": "纳指ETF"         # 海外资产
+  "512660": "军工ETF"         # 独立行情
+  "511260": "国债ETF"         # 避险资产
+  "159949": "创业板50ETF"         # 成长风格
+# etf_pool:
+  # "510300": "沪深300ETF"      # 大盘基准
+  # # "518880": "黄金ETF"         # 大宗商品
+  # "513100": "纳指100ETF"      # 海外资产
+  # "513030": "德国ETF"         # 德国
+  # "513090": "港股ETF"         # 港股
+  # "159915": "创业板100ETF"    # 成长股，科技股，中小盘
+  # "510180": "上证180ETF"      # 价值股，蓝筹股，中大盘
+  # "511010": "国债ETF"         # 防守型
+
+# start_date: "20210101"
+# end_date: "20251231"
+
+# start_date: "20200101"
+# end_date: "20201231"
+
+start_date: "20250101"
+end_date: "20251231"
+
+initial_cash: 100000.0
+asset_type: "stock"
+lot_size: 100
+commission_rate: 0.0003
+data_source: "akshare" # "akshare" or "tushare"
+strategy: "RotationStrategy" # "DoubleMAStrategy" "AgentStrategy" "BenchmarkStrategy" "RotationStrategy"
+
+# LLM 多配置（Agent 策略）：通过 llm.active 切换，API Key 从 .env 中对应 env_key 读取
+# 真实模型/端点名请在 .env 中配置（ARK_MODEL、NVIDIA_MODEL 等），会覆盖此处占位符，勿提交到 git
+llm:
+  active: volcano  # 可选: nvidia | volcano
+  providers:
+    nvidia:
+      base_url: "https://integrate.api.nvidia.com/v1"
+      # 可在 .env 中设置 NVIDIA_MODEL 覆盖
+      model: "YOUR_NVIDIA_MODEL"
+      env_key: NVIDIA_API_KEY
+      agent_models:
+        market_analyst: "YOUR_NVIDIA_MODEL_ANALYST"
+        risk_manager: "YOUR_NVIDIA_MODEL_RISK"
+        fund_manager: "YOUR_NVIDIA_MODEL_FUND"
+    volcano:
+      base_url: "https://ark.cn-beijing.volces.com/api/v3"
+      # 可在 .env 中设置 ARK_MODEL 覆盖
+      model: "YOUR_ARK_ENDPOINT_ID"
+      env_key: ARK_API_KEY
+      agent_models:
+        market_analyst: "YOUR_ARK_ENDPOINT_ID"
+        risk_manager: "YOUR_ARK_ENDPOINT_ID"
+        fund_manager: "YOUR_ARK_ENDPOINT_ID"

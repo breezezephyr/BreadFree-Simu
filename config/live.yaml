@@ -1,0 +1,89 @@
+# BreadFree Live Trading Configuration
+# ────────────────────────────────────
+
+# Gateway configuration
+# type: "simulated" | "futu" | "qmt"
+gateway:
+  type: simulated
+  initial_cash: 100000
+  commission_rate: 0.0003
+  # Futu-specific (uncomment to use):
+  # type: futu
+  # host: "127.0.0.1"
+  # port: 11111
+  # trade_password: "your_password"
+  # trade_env: "SIMULATE"    # SIMULATE or REAL
+  # market: "HK"
+  #
+  # QMT-specific (uncomment to use):
+  # type: qmt
+  # mini_qmt_path: "D:\\国金证券QMT交易端\\userdata_mini"
+  # session_id: 123456
+  # account_id: "your_account_id"
+
+# Market: A_SHARE | HK | US
+market: A_SHARE
+
+# Symbols to trade
+symbols:
+  - "510300"   # 沪深300ETF
+  - "510500"   # 中证500ETF
+  - "159915"   # 创业板ETF
+  - "512880"   # 证券ETF
+  - "510880"   # 红利ETF
+  - "513100"   # 纳指ETF
+  - "512660"   # 军工ETF
+  - "511260"   # 十年国债ETF
+  - "159949"   # 创业板50ETF
+
+# Strategy configuration
+# Available strategies:
+#   - RotationStrategy:  Rule-based efficiency rotation (no LLM)
+#   - EffiA:             LLM multi-agent efficiency rotation (requires LLM API key)
+#   - DoubleMAStrategy:  Double moving average crossover
+#   - TripleMomentumStrategy: Triple momentum factor
+#   - BenchmarkStrategy: Buy-and-hold benchmark
+strategy:
+  name: RotationStrategy
+  params:
+    lookback_period: 20
+    hold_period: 20
+    top_n: 3
+    use_efficiency: true
+  # LLM Agent strategy example (uncomment to use):
+  # name: EffiA
+  # params:
+  #   lookback_period: 20
+  #   hold_period: 20
+  # graph_timeout_seconds: 180    # Max seconds for entire agent graph execution
+
+# Risk management
+risk:
+  max_position_pct: 0.40       # 单只标的最大仓位 40%
+  max_order_value: 500000      # 单笔最大金额 50 万
+  max_daily_trades: 100        # 每日最大交易次数
+  check_t1: true               # A股 T+1 检查
+  max_drawdown_pct: 0.20       # 最大回撤 20% 触发锁仓
+  blacklist: []                # 黑名单标的
+
+# Scheduler timing
+scheduler:
+  pre_market_time: "09:15"
+  strategy_trigger_time: "14:50"
+  post_market_time: "15:05"
+  nightly_time: "21:00"
+
+# Alert configuration
+alert:
+  enabled: true
+  min_level: "WARNING"           # INFO / WARNING / CRITICAL
+  rate_limit_per_min: 20
+  # Uncomment to enable push notifications:
+  # wechat_webhook: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY"
+  # dingtalk_webhook: "https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN"
+
+# Data source
+data_source: akshare
+lot_size: 100
+initial_cash: 100000
+commission_rate: 0.0003
