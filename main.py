@@ -30,12 +30,13 @@ from breadfree.strategies.benchmark_strategy import BenchmarkStrategy
 from breadfree.strategies.effi_rotation_strategy import RotationStrategy
 from breadfree.strategies.effi_agent_strategy import EffiAgentRotationStrategy
 from breadfree.strategies.triple_momentum_strategy import TripleMomentumStrategy
+from breadfree.strategies.agent_strategy_v2 import AgentStrategyV2
 
 def main():
     # 1. Define command line arguments
     parser = argparse.ArgumentParser(description='BreadFree Backtest Engine')
     parser.add_argument('--strategy', type=str, help='Strategy name', choices=[
-        'DoubleMAStrategy', 'BenchmarkStrategy', 'AgentStrategy', 'RotationStrategy', 'EffiA', 'TripleMomentumStrategy'
+        'DoubleMAStrategy', 'BenchmarkStrategy', 'AgentStrategy', 'AgentStrategyV2', 'RotationStrategy', 'EffiA', 'TripleMomentumStrategy'
     ])
     parser.add_argument('--start_date', type=str, help='Start date YYYYMMDD')
     parser.add_argument('--end_date', type=str, help='End date YYYYMMDD')
@@ -82,6 +83,7 @@ def main():
         "DoubleMAStrategy": DoubleMAStrategy,
         "BenchmarkStrategy": BenchmarkStrategy,
         "AgentStrategy": AgentStrategy,
+        "AgentStrategyV2": AgentStrategyV2,
         "RotationStrategy": RotationStrategy,
         "EffiA": EffiAgentRotationStrategy,
         "TripleMomentumStrategy": TripleMomentumStrategy
