@@ -71,10 +71,17 @@ async def async_hunyuan_chat(
         top_p=0.3, 
         max_tokens=4096,
         stream=False,
+        timeout_seconds: int = 60,
+        max_retries: int = 2,
     ):
     """
     通用 LLM 对话接口，支持通过 config.yaml 配置多 provider（nvidia、volcano 等）。
     
+    实盘增强:
+    - timeout_seconds: 单次调用超时（默认 60s，实盘中避免无限等待）
+    - max_retries: 失败重试次数（默认 2 次，含首次共 3 次尝试）
+    - 每次重试间隔 2s（指数退避可后续优化）
+
     Args:
         query: User query/question
         prompt: System prompt
@@ -83,61 +90,83 @@ async def async_hunyuan_chat(
         top_p: Nucleus sampling parameter
         max_tokens: Maximum tokens in response
         stream: Whether to stream the response
+        timeout_seconds: Timeout per attempt in seconds
+        max_retries: Number of retries on failure
     """
-    try:
-        # 每次调用时从 config.yaml + 环境变量取当前 LLM 配置
-        provider_name, client_spec = _get_llm_client_config()
-        api_key = client_spec.get("api_key")
-        if not api_key or api_key == "YOUR_API_KEY_HERE":
-            env_key = (_load_llm_config()[1].get(provider_name) or {}).get("env_key", "LLM_API_KEY")
-            raise RuntimeError(
-                f"No valid API key for provider '{provider_name}'. Set {env_key} or LLM_API_KEY in .env"
+    import time as _time
+
+    last_error = None
+    for attempt in range(1 + max_retries):
+        try:
+            # 每次调用时从 config.yaml + 环境变量取当前 LLM 配置
+            provider_name, client_spec = _get_llm_client_config()
+            api_key = client_spec.get("api_key")
+            if not api_key or api_key == "YOUR_API_KEY_HERE":
+                env_key = (_load_llm_config()[1].get(provider_name) or {}).get("env_key", "LLM_API_KEY")
+                raise RuntimeError(
+                    f"No valid API key for provider '{provider_name}'. Set {env_key} or LLM_API_KEY in .env"
+                )
+            base_url = client_spec.get("base_url")
+            selected_model = model or client_spec.get("model")
+            if not base_url or not selected_model:
+                raise ValueError(f"Missing base_url or model for provider '{provider_name}' in config")
+            
+            client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=float(timeout_seconds),
             )
-        base_url = client_spec.get("base_url")
-        selected_model = model or client_spec.get("model")
-        if not base_url or not selected_model:
-            raise ValueError(f"Missing base_url or model for provider '{provider_name}' in config")
-        
-        client = OpenAI(api_key=api_key, base_url=base_url)
-        messages=[]
-        if prompt is not None:
-            messages.append({"role": "system", "content": prompt})
-        if query is not None:
-            messages.append({"role": "user", "content": query})
-        
-        # Log the request（model 便于与下方 token 日志对应）
-        logging.info(
-            f"LLM request | provider={provider_name} | model={selected_model} | query_len={sum(len(m.get('content', '') or '') for m in messages)}"
-        )
-        completion = client.chat.completions.create(
-            model=selected_model,
-            messages=messages,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            stream=stream,
-        )
-        
-        response_content = completion.choices[0].message.content or ""
-        usage = getattr(completion, "usage", None)
-        prompt_tokens = getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", None)
-        completion_tokens = getattr(usage, "completion_tokens", None) or getattr(usage, "output_tokens", None)
-        total_tokens = getattr(usage, "total_tokens", None) or (prompt_tokens + completion_tokens if (prompt_tokens is not None and completion_tokens is not None) else None)
-        if total_tokens is None:
-            total_tokens = 0
+            messages=[]
+            if prompt is not None:
+                messages.append({"role": "system", "content": prompt})
+            if query is not None:
+                messages.append({"role": "user", "content": query})
+            
+            retry_tag = f" (retry {attempt})" if attempt > 0 else ""
+            # Log the request（model 便于与下方 token 日志对应）
+            logging.info(
+                f"LLM request{retry_tag} | provider={provider_name} | model={selected_model} | query_len={sum(len(m.get('content', '') or '') for m in messages)}"
+            )
 
-        # 日志：model、input tokens、output tokens（便于排查与计费）
-        logging.info(
-            f"LLM call | model={selected_model} | input_tokens={prompt_tokens} | output_tokens={completion_tokens} | total_tokens={total_tokens}"
-        )
-        logging.info(f"--- LLM Response ---\nContent: {response_content[:500]}{'...' if len(response_content) > 500 else ''}\n--------------------")
+            start_ms = int(_time.time() * 1000)
+            completion = client.chat.completions.create(
+                model=selected_model,
+                messages=messages,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                stream=stream,
+            )
+            latency_ms = int(_time.time() * 1000) - start_ms
+            
+            response_content = completion.choices[0].message.content or ""
+            usage = getattr(completion, "usage", None)
+            prompt_tokens = getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", None)
+            completion_tokens = getattr(usage, "completion_tokens", None) or getattr(usage, "output_tokens", None)
+            total_tokens = getattr(usage, "total_tokens", None) or (prompt_tokens + completion_tokens if (prompt_tokens is not None and completion_tokens is not None) else None)
+            if total_tokens is None:
+                total_tokens = 0
 
-        return response_content, total_tokens
-    except Exception as e:
-        error_msg = f"LLM Call Error: {e}"
-        print(error_msg)
-        logging.error(error_msg)
-        return "", 0
+            # 日志：model、input tokens、output tokens（便于排查与计费）
+            logging.info(
+                f"LLM call | model={selected_model} | input_tokens={prompt_tokens} | output_tokens={completion_tokens} | total_tokens={total_tokens} | latency={latency_ms}ms"
+            )
+            logging.info(f"--- LLM Response ---\nContent: {response_content[:500]}{'...' if len(response_content) > 500 else ''}\n--------------------")
+
+            return response_content, total_tokens
+
+        except Exception as e:
+            last_error = e
+            error_msg = f"LLM Call Error (attempt {attempt + 1}/{1 + max_retries}): {e}"
+            logging.error(error_msg)
+            if attempt < max_retries:
+                wait = 2 * (attempt + 1)
+                logging.info(f"LLM retrying in {wait}s...")
+                _time.sleep(wait)
+
+    # All attempts failed
+    logging.error(f"LLM all {1 + max_retries} attempts failed. Last error: {last_error}")
+    return "", 0
 
 def parse_llm_response(response: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
     """

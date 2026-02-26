@@ -4,12 +4,16 @@ import numpy as np
 import json
 import re
 import asyncio
+import time
 from langgraph.graph import StateGraph, END
 from collections import defaultdict
 from .base_strategy import BreadFreeStrategy
 from ..utils.llm_client import async_hunyuan_chat, parse_llm_response
 from ..utils.metrics import calculate_efficiency_metrics
 from ..utils.portfolio import normalize_weights
+from ..utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 # --- Prompts ---
 
@@ -73,6 +77,7 @@ class AgentState(TypedDict):
     risk_output: Dict[str, Any]
     lot_size: int
     target_weights: Dict[str, float]
+    llm_calls: List[Dict[str, Any]]  # LLM call audit records
 
 # --- Helper Functions (Math) ---
 
@@ -119,16 +124,16 @@ def data_prep_node(state: AgentState) -> AgentState:
         if is_holding:
             filtered_metrics[symbol]["holding_qty"] = positions[symbol]
     
-    print(f"[DataPrep] Identified Top 3: {top_3}, and extra holdings: {[s for s in current_holdings if s not in top_3]}")
+    logger.info(f"[DataPrep] Identified Top 3: {top_3}, extra holdings: {[s for s in current_holdings if s not in top_3]}")
     if not filtered_metrics:
-        print("[DataPrep] Warning: no metrics generated")
+        logger.warning("[DataPrep] No metrics generated")
     return {"metrics": filtered_metrics}
 
 async def analyst_agent_node(state: AgentState) -> AgentState:
     metrics = state["metrics"]
     if not metrics:
-        print("[Analyst] Empty metrics, returning fallback")
-        return {"analyst_output": {}}
+        logger.info("[Analyst] Empty metrics, returning fallback")
+        return {"analyst_output": {}, "llm_calls": state.get("llm_calls", [])}
     
     # Sort by Efficiency from high to low to ensure analyst sees the real Top N
     sorted_metrics_items = sorted(metrics.items(), key=lambda x: x[1].get('efficiency', 0), reverse=True)
@@ -142,7 +147,7 @@ async def analyst_agent_node(state: AgentState) -> AgentState:
                 f"Efficiency={data['efficiency']:.2f}{holding_info}")
         summary_lines.append(line)
     summary_text = "\n".join(summary_lines)
-    print(f"[Analyst] Sorted Market Data Summary:\n{summary_text}")
+    logger.info(f"[Analyst] Sorted Market Data Summary:\n{summary_text}")
     prompt = ANALYST_PROMPT.format(market_data_summary=summary_text)
     
     # Build more meaningful fallback
@@ -151,23 +156,46 @@ async def analyst_agent_node(state: AgentState) -> AgentState:
     for s, w in fallback_weights.items():
         fallback[s] = {"weight": w, "view": "bullish", "reason": "top efficiency"}
     
+    llm_calls = list(state.get("llm_calls", []))
+    used_fallback = False
+    start_ms = int(time.time() * 1000)
     try:
-        response, _ = await async_hunyuan_chat(query="Analyze and select top ETFs.", prompt=prompt)
+        response, tokens = await async_hunyuan_chat(
+            query="Analyze and select top ETFs.", prompt=prompt,
+            timeout_seconds=60, max_retries=2,
+        )
+        latency_ms = int(time.time() * 1000) - start_ms
         analyst_decision = parse_llm_response(response, fallback)
+        if response == "" or analyst_decision is fallback:
+            used_fallback = True
+        llm_calls.append({
+            "agent": "analyst", "tokens": tokens, "latency_ms": latency_ms,
+            "prompt_len": len(prompt), "response_len": len(response),
+            "used_fallback": used_fallback,
+        })
     except Exception as e:
-        print(f"[Analyst ERROR] {e}")
+        latency_ms = int(time.time() * 1000) - start_ms
+        logger.error(f"[Analyst ERROR] {e}")
         analyst_decision = fallback
+        used_fallback = True
+        llm_calls.append({
+            "agent": "analyst", "tokens": 0, "latency_ms": latency_ms,
+            "error": str(e), "used_fallback": True,
+        })
 
     # Extract suggested weights for logging
     proposed = {s: (v.get("weight") if isinstance(v, dict) else 0) for s, v in analyst_decision.items()}
-    print(f"[Analyst] Analysis Complete. Proposed Weights: {proposed}")
-    return {"analyst_output": analyst_decision}
+    logger.info(f"[Analyst] Analysis Complete. Proposed Weights: {proposed}"
+                f"{' (FALLBACK)' if used_fallback else ''}")
+    return {"analyst_output": analyst_decision, "llm_calls": llm_calls}
 
 async def risk_manager_node(state: AgentState) -> AgentState:
     analyst_output = state.get("analyst_output", {})
     if not analyst_output:
-        print("[Risk Manager] No analysis → cash")
-        return {"risk_output": {"target_weights": {}, "approved": True}, "target_weights": {}}
+        logger.info("[Risk Manager] No analysis -> cash")
+        return {"risk_output": {"target_weights": {}, "approved": True},
+                "target_weights": {},
+                "llm_calls": state.get("llm_calls", [])}
     
     prompt = RISK_MANAGER_PROMPT.format(
         analyst_proposal=json.dumps(analyst_output),
@@ -177,22 +205,45 @@ async def risk_manager_node(state: AgentState) -> AgentState:
     fallback_weights = get_fallback_weights(state.get("metrics", {}))
     fallback = {"target_weights": fallback_weights, "approved": True}
     
+    llm_calls = list(state.get("llm_calls", []))
+    used_fallback = False
+    start_ms = int(time.time() * 1000)
     try:
-        response, _ = await async_hunyuan_chat(query="Assess risk and allocate weights.", prompt=prompt)
+        response, tokens = await async_hunyuan_chat(
+            query="Assess risk and allocate weights.", prompt=prompt,
+            timeout_seconds=60, max_retries=2,
+        )
+        latency_ms = int(time.time() * 1000) - start_ms
         risk_decision = parse_llm_response(response, fallback)
+        if response == "" or risk_decision is fallback:
+            used_fallback = True
+        llm_calls.append({
+            "agent": "risk_manager", "tokens": tokens, "latency_ms": latency_ms,
+            "prompt_len": len(prompt), "response_len": len(response),
+            "used_fallback": used_fallback,
+        })
     except Exception as e:
-        print(f"[Risk ERROR] {e}")
+        latency_ms = int(time.time() * 1000) - start_ms
+        logger.error(f"[Risk ERROR] {e}")
         risk_decision = fallback
+        used_fallback = True
+        llm_calls.append({
+            "agent": "risk_manager", "tokens": 0, "latency_ms": latency_ms,
+            "error": str(e), "used_fallback": True,
+        })
         
     target_weights = risk_decision.get("target_weights", {})
     if not target_weights or sum(target_weights.values()) <= 0:
-        print("[Risk] Invalid output → using fallback")
+        logger.info("[Risk] Invalid output -> using fallback weights")
         target_weights = fallback_weights
+        used_fallback = True
         
     target_weights = normalize_weights(target_weights)
     risk_decision["target_weights"] = target_weights
-    print(f"[Risk Final] target_weights={target_weights}")
-    return {"risk_output": risk_decision, "target_weights": target_weights}
+    logger.info(f"[Risk Final] target_weights={target_weights}"
+                f"{' (FALLBACK)' if used_fallback else ''}")
+    return {"risk_output": risk_decision, "target_weights": target_weights,
+            "llm_calls": llm_calls}
 
 # --- Graph Construction ---
 
@@ -210,12 +261,37 @@ def build_agent_graph():
 # --- Strategy Class ---
 
 class EffiAgentRotationStrategy(BreadFreeStrategy):
-    def __init__(self, broker, lookback_period=20, hold_period=20, lot_size=100, **kwargs):
+    """
+    LLM Multi-Agent Efficiency Rotation Strategy.
+
+    Uses LangGraph to orchestrate:
+    1. DataPrep -> 2. Analyst Agent (LLM) -> 3. Risk Manager Agent (LLM)
+
+    Live-trading enhancements (Phase 5):
+    - Graph execution timeout (default 180s) to avoid indefinite blocking
+    - LLM call-level timeout + retry (delegated to llm_client)
+    - Fallback to rule-based weights when all LLM calls fail
+    - Structured LLM call records for audit logging
+    - Proper async handling for both backtest and live event loops
+    """
+
+    def __init__(self, broker, lookback_period=20, hold_period=20, lot_size=100,
+                 graph_timeout_seconds=180, audit_logger=None, **kwargs):
+        """
+        :param graph_timeout_seconds: Max seconds for the entire agent graph execution
+        :param audit_logger: Optional AuditLogger instance for LLM call recording
+        """
         super().__init__(broker, lot_size=lot_size)
         self.lookback_period = lookback_period
         self.hold_period = hold_period
         self.days_counter = 0
+        self.graph_timeout_seconds = graph_timeout_seconds
+        self.audit_logger = audit_logger
         self.app = build_agent_graph()
+        # Track cumulative LLM stats
+        self._total_llm_calls = 0
+        self._total_llm_tokens = 0
+        self._total_llm_fallbacks = 0
         
     def on_bar(self, date, bars):
         for symbol, bar in bars.items():
@@ -228,13 +304,13 @@ class EffiAgentRotationStrategy(BreadFreeStrategy):
         data_ready = len(not_ready_symbols) == 0
         
         if not data_ready:
-            print(f"[INFO] Data not ready on {date}. Missing lookback for: {not_ready_symbols}")
+            logger.info(f"Data not ready on {date}. Missing lookback for: {not_ready_symbols}")
             return
 
         if self.days_counter % self.hold_period != 0 and self.days_counter > 1:
             return
             
-        print(f"[INFO] LangGraph Agents Triggered on {date}")
+        logger.info(f"LangGraph Agents Triggered on {date}")
         
         history_snapshot = {s: list(self.history[s]) for s in bars.keys()}
         pos_snapshot = {s: getattr(self.broker.positions[s], 'quantity', self.broker.positions[s])
@@ -251,33 +327,117 @@ class EffiAgentRotationStrategy(BreadFreeStrategy):
             "analyst_output": {},
             "risk_output": {},
             "lot_size": self.lot_size,
-            "target_weights": {}
+            "target_weights": {},
+            "llm_calls": [],
         }
         
+        graph_start = time.time()
+        final_state = None
         try:
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    final_state = loop.run_until_complete(self.app.ainvoke(initial_state))
-                else:
-                    final_state = asyncio.run(self.app.ainvoke(initial_state))
-            except RuntimeError:
-                final_state = asyncio.run(self.app.ainvoke(initial_state))
+            final_state = self._run_agent_graph(initial_state)
+            graph_elapsed = time.time() - graph_start
+
+            target_weights = final_state.get("target_weights", {})
+            llm_calls = final_state.get("llm_calls", [])
+
+            logger.info(f"[GRAPH DONE] target_weights={target_weights} "
+                        f"graph_time={graph_elapsed:.1f}s llm_calls={len(llm_calls)}")
             
-            print(f"[GRAPH DONE] target_weights = {final_state.get('target_weights')}")
-            self._execute_trades(date, final_state.get("target_weights", {}), bars)
+            # Audit LLM calls
+            self._audit_llm_calls(llm_calls, date, target_weights)
+
+            self._execute_trades(date, target_weights, bars)
             
+        except asyncio.TimeoutError:
+            graph_elapsed = time.time() - graph_start
+            logger.error(f"[GRAPH TIMEOUT] Agent graph exceeded {self.graph_timeout_seconds}s "
+                        f"(actual: {graph_elapsed:.1f}s). Using fallback weights.")
+            # Fallback: rule-based weights from metrics
+            fallback_weights = get_fallback_weights(
+                final_state.get("metrics", {}) if final_state else {}
+            )
+            if fallback_weights:
+                from ..utils.portfolio import normalize_weights as _nw
+                fallback_weights = _nw(fallback_weights)
+                logger.info(f"[GRAPH TIMEOUT FALLBACK] weights={fallback_weights}")
+                self._execute_trades(date, fallback_weights, bars)
+            self._total_llm_fallbacks += 1
+            if self.audit_logger:
+                self.audit_logger.log_system_event(
+                    "AGENT_TIMEOUT",
+                    f"Graph timeout after {graph_elapsed:.1f}s on {date}",
+                    level="ERROR")
         except Exception as e:
-            print(f"[GRAPH ERROR] {e}")
+            logger.error(f"[GRAPH ERROR] {e}", exc_info=True)
+            if self.audit_logger:
+                self.audit_logger.log_system_event(
+                    "AGENT_ERROR", f"Graph error on {date}: {e}", level="ERROR")
+
+    def _run_agent_graph(self, initial_state: dict) -> dict:
+        """
+        Execute the LangGraph agent graph with timeout protection.
+
+        Handles the tricky asyncio situation:
+        - In backtest mode: no event loop running, use asyncio.run()
+        - In live mode: scheduler may have a running loop
+        """
+        async def _run_with_timeout():
+            return await asyncio.wait_for(
+                self.app.ainvoke(initial_state),
+                timeout=self.graph_timeout_seconds,
+            )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None and loop.is_running():
+            # We're inside a running event loop (e.g., Jupyter, some live schedulers).
+            # Create a new thread to run the async code.
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(asyncio.run, _run_with_timeout())
+                return future.result(timeout=self.graph_timeout_seconds + 10)
+        else:
+            return asyncio.run(_run_with_timeout())
+
+    def _audit_llm_calls(self, llm_calls: list, date, target_weights: dict):
+        """Record LLM call details to audit logger if available."""
+        for call in llm_calls:
+            self._total_llm_calls += 1
+            self._total_llm_tokens += call.get("tokens", 0)
+            if call.get("used_fallback"):
+                self._total_llm_fallbacks += 1
+
+            if self.audit_logger:
+                agent = call.get("agent", "unknown")
+                self.audit_logger.log_llm_call(
+                    model=f"agent:{agent}",
+                    prompt_summary=f"{agent} on {date} (prompt_len={call.get('prompt_len', 0)})",
+                    response_summary=f"resp_len={call.get('response_len', 0)}, "
+                                     f"fallback={call.get('used_fallback', False)}",
+                    tokens_used=call.get("tokens", 0),
+                    latency_ms=call.get("latency_ms", 0),
+                )
+
+        # Log overall strategy decision
+        if self.audit_logger:
+            self.audit_logger.log_strategy_decision(
+                strategy_name="EffiAgentRotation",
+                signals=[{"symbol": s, "weight": w} for s, w in target_weights.items()],
+                reasoning=f"date={date}, llm_calls={len(llm_calls)}, "
+                          f"fallbacks={sum(1 for c in llm_calls if c.get('used_fallback'))}",
+            )
 
     def broker_positions_and_pool(self, current_bars):
         return list(set(list(self.broker.positions.keys()) + list(current_bars.keys())))
 
     def _execute_trades(self, date, target_weights: Dict[str, float], bars):
         if not target_weights:
-            pass
+            return
 
-        print(f"[EXECUTE] Allocation: {target_weights}")
+        logger.info(f"[EXECUTE] Allocation: {target_weights}")
         
         total_asset_value = self.broker.cash
         for s, pos in self.broker.positions.items():
@@ -300,7 +460,7 @@ class EffiAgentRotationStrategy(BreadFreeStrategy):
             if current_qty > target_qty:
                 sell_qty = current_qty - target_qty
                 self.broker.sell(date, symbol, price, sell_qty)
-                print(f"[SELL] {symbol}: {sell_qty}")
+                logger.info(f"[SELL] {symbol}: {sell_qty}")
 
         # Buy after
         current_cash = self.broker.cash
@@ -321,6 +481,14 @@ class EffiAgentRotationStrategy(BreadFreeStrategy):
                 if current_cash >= cost:
                     self.broker.buy(date, symbol, price, buy_qty)
                     current_cash -= cost
-                    print(f"[BUY] {symbol}: {buy_qty}")
+                    logger.info(f"[BUY] {symbol}: {buy_qty}")
                 else:
-                    print(f"[WARN] Not enough cash to buy {symbol}")
+                    logger.warning(f"Not enough cash to buy {symbol}")
+
+    def get_llm_stats(self) -> dict:
+        """Get cumulative LLM usage statistics."""
+        return {
+            "total_llm_calls": self._total_llm_calls,
+            "total_llm_tokens": self._total_llm_tokens,
+            "total_fallbacks": self._total_llm_fallbacks,
+        }

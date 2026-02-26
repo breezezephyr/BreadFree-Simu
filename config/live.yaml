@@ -37,6 +37,12 @@ symbols:
   - "159949"   # 创业板50ETF
 
 # Strategy configuration
+# Available strategies:
+#   - RotationStrategy:  Rule-based efficiency rotation (no LLM)
+#   - EffiA:             LLM multi-agent efficiency rotation (requires LLM API key)
+#   - DoubleMAStrategy:  Double moving average crossover
+#   - TripleMomentumStrategy: Triple momentum factor
+#   - BenchmarkStrategy: Buy-and-hold benchmark
 strategy:
   name: RotationStrategy
   params:
@@ -44,6 +50,12 @@ strategy:
     hold_period: 20
     top_n: 3
     use_efficiency: true
+  # LLM Agent strategy example (uncomment to use):
+  # name: EffiA
+  # params:
+  #   lookback_period: 20
+  #   hold_period: 20
+  # graph_timeout_seconds: 180    # Max seconds for entire agent graph execution
 
 # Risk management
 risk:

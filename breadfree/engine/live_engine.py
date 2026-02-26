@@ -31,6 +31,7 @@ from .broker import Broker
 from .broker_adapter import BrokerAdapter
 from .event_bus import EventBus
 from .order_manager import OrderManager
+from .order_managed_broker import OrderManagedBroker
 from .risk_manager import RiskManager
 from .scheduler import TradingScheduler, Market
 from .models import Event, EventType, Order, Trade
@@ -130,7 +131,10 @@ class LiveEngine:
             event_bus=self.event_bus,
         )
 
-        # 5. Strategy
+        # 5. Create proxy broker that routes strategy trades through OMS+Risk
+        self.strategy_broker = OrderManagedBroker(self.broker, self.order_manager)
+
+        # 6. Strategy (receives proxy broker so all trades go through risk checks)
         self.strategy = self._create_strategy()
 
         # 6. Scheduler
@@ -185,7 +189,14 @@ class LiveEngine:
         return Broker(initial_cash=initial_cash, commission_rate=commission_rate)
 
     def _create_strategy(self):
-        """Create strategy instance from config."""
+        """Create strategy instance from config.
+
+        Strategies receive self.strategy_broker (an OrderManagedBroker proxy)
+        so that all buy/sell calls go through the OMS + RiskManager pipeline.
+
+        For LLM-based strategies (EffiA), also inject audit_logger for
+        recording LLM calls and agent decisions.
+        """
         strategy_config = self.config.get("strategy", {})
         strategy_name = strategy_config.get("name", "RotationStrategy")
         strategy_params = strategy_config.get("params", {})
@@ -205,13 +216,27 @@ class LiveEngine:
             "TripleMomentumStrategy": TripleMomentumStrategy,
         }
 
+        # LLM agent strategies that accept audit_logger
+        _AGENT_STRATEGIES = {"EffiA"}
+
         strategy_cls = strategy_map.get(strategy_name, RotationStrategy)
         lot_size = self.config.get("lot_size", 100)
 
-        strategy = strategy_cls(self.broker, lot_size=lot_size, **strategy_params)
+        # Inject audit_logger for agent strategies
+        extra_kwargs = {}
+        if strategy_name in _AGENT_STRATEGIES:
+            extra_kwargs["audit_logger"] = self.audit
+            extra_kwargs["graph_timeout_seconds"] = strategy_config.get(
+                "graph_timeout_seconds", 180)
+
+        strategy = strategy_cls(
+            self.strategy_broker, lot_size=lot_size,
+            **strategy_params, **extra_kwargs,
+        )
         strategy.set_symbols(self.symbols)
 
-        logger.info(f"[LiveEngine] Strategy: {strategy_name} with params: {strategy_params}")
+        logger.info(f"[LiveEngine] Strategy: {strategy_name} with params: {strategy_params}"
+                    f"{' (with audit)' if extra_kwargs else ''}")
         return strategy
 
     # ──────────────────────────────────────────
@@ -314,11 +339,20 @@ class LiveEngine:
             logger.info(f"[LiveEngine] Running strategy with {len(bars)} symbols...")
             self.strategy.on_bar(now, bars)
             logger.info("[LiveEngine] Strategy execution completed")
-            self.audit.log_strategy_decision(
-                self.strategy.__class__.__name__,
-                signals=[],
-                reasoning=f"Triggered at {now.strftime('%H:%M:%S')} with {len(bars)} symbols",
-            )
+
+            # For agent strategies, the audit is handled internally via audit_logger.
+            # For non-agent strategies, log a basic decision record here.
+            if not hasattr(self.strategy, 'audit_logger') or self.strategy.audit_logger is None:
+                self.audit.log_strategy_decision(
+                    self.strategy.__class__.__name__,
+                    signals=[],
+                    reasoning=f"Triggered at {now.strftime('%H:%M:%S')} with {len(bars)} symbols",
+                )
+
+            # Log LLM stats if available (agent strategies)
+            if hasattr(self.strategy, 'get_llm_stats'):
+                llm_stats = self.strategy.get_llm_stats()
+                logger.info(f"[LiveEngine] LLM stats: {llm_stats}")
         except Exception as e:
             logger.error(f"[LiveEngine] Strategy execution failed: {e}", exc_info=True)
             self.alert_manager.send_critical(f"Strategy execution failed: {e}")
