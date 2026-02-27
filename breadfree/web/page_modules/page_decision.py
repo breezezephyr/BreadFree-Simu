@@ -3,7 +3,7 @@ import streamlit as st
 import pandas as pd
 import json, os, time
 from datetime import datetime, timedelta
-from .utils import load_config, get_pool, sym_name
+from breadfree.web.page_modules.utils import load_config, get_pool, sym_name
 
 
 def render():

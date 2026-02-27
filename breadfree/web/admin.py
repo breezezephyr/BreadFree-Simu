@@ -27,7 +27,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-from breadfree.web.pages import page_market, page_news, page_backtest, page_decision
+from breadfree.web.page_modules import page_market, page_news, page_backtest, page_decision
 
 # ── Sidebar ──
 st.sidebar.title("🏦 BreadFree")

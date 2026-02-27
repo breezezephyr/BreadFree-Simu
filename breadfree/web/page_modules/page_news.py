@@ -2,7 +2,7 @@
 import streamlit as st
 import pandas as pd
 import json, os
-from .utils import get_pool, sym_name
+from breadfree.web.page_modules.utils import get_pool, sym_name
 
 
 def render():

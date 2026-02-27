@@ -3,7 +3,7 @@ import streamlit as st
 import pandas as pd
 import json, os, time, subprocess
 from datetime import datetime, timedelta
-from .utils import load_config, get_pool, sym_name
+from breadfree.web.page_modules.utils import load_config, get_pool, sym_name
 
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "data", "cache", "backtest_history.json")
 
