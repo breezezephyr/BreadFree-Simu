@@ -1,12 +1,22 @@
-from typing import TypedDict, List, Dict, Any, Optional
-import pandas as pd
-import numpy as np
-import json
-import re
+"""
+EffiAgentRotationStrategy — LLM 多智能体效率轮动策略
+
+架构: QuantPrep (纯计算) → Analyst Agent (LLM) → RiskMgr Agent (LLM)
+- QuantPrep: 效率分/动量/R² 筛选 Top-N 候选
+- Analyst: LLM 分析选股 + 权重分配
+- RiskMgr: LLM 风控微调, 输出最终目标权重
+
+仅在调仓日调用 LLM, 其余交易日跳过 (大幅减少 LLM 消耗).
+LLM 全部失败时自动 fallback 为纯效率轮动.
+"""
+
 import asyncio
+import json
 import time
+from typing import TypedDict, List, Dict, Any
+
 from langgraph.graph import StateGraph, END
-from collections import defaultdict
+
 from .base_strategy import BreadFreeStrategy
 from ..utils.llm_client import async_hunyuan_chat, parse_llm_response
 from ..utils.metrics import calculate_efficiency_metrics
@@ -14,8 +24,6 @@ from ..utils.portfolio import normalize_weights
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-# --- Prompts ---
 
 ANALYST_PROMPT = """
 You are a Senior Quantitative ETF Analyst.
