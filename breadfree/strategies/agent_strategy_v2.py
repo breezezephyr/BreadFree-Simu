@@ -1,19 +1,22 @@
 """
-AgentStrategyV2 — 多智能体涌现决策系统 (V2 Architecture)
+AgentStrategyV2 — 量化锚定 + LLM 精调决策系统
 
-三阶段流水线:
-    QuantPrep (纯计算)  →  Analyst Agent (LLM)  →  RiskMgr Agent (LLM)
-      ↓ 多周期因子           ↓ 选股+权重+理由         ↓ 风控微调+终裁
-      筛选Top-N候选          结构化JSON输出            平衡型风控
+核心理念: "量化选股, LLM 定权"
+    QuantPrep 选出 Top-N 候选 (不可更改)
+    Analyst LLM 在 Top-N 内分配权重 (可集中/分散, 但不能引入新标的)
+    RiskMgr LLM 微调权重 (可减仓+留现金, 但不能引入新标的)
 
-7 项核心设计:
-    1. 多资产轮动: 分析全部 N 只标的, 选 Top-N 配置
-    2. 信号先行: 量化效率分筛选候选, LLM 做精调而非主决策
-    3. 周期调仓: 仅调仓日调 LLM (3个月仅6次 vs V1的180次)
-    4. Prompt 重构: 去除保守偏见, 引入定量投资框架, 强制量化推理
-    5. 决策记忆: 传递上期持仓、收益、决策理由上下文
-    6. 佣金感知下单: 计算手数时扣除佣金
-    7. 健壮 fallback: LLM 失败自动退化为纯效率轮动
+为何不让 LLM 自由选股:
+    - 效率分/动量等量化因子已高度提炼 alpha 信号
+    - LLM 自由选股会引入"防御偏差"(过度配置债券/红利), 拖累趋势收益
+    - LLM 的真正价值在于: 理解因子间微妙关系, 做出更精准的权重分配
+
+架构改进 (V2.1):
+    1. 量化锚定: LLM 只能在 QuantPrep 的 Top-N 内分配权重
+    2. 基准权重: 提供等权基准, LLM 在此基础上调整 ±20%
+    3. 最低投资度: 总投资比例不低于 85% (杜绝过度保守)
+    4. 决策记忆: 传递上期收益反馈, 形成学习闭环
+    5. 多周期因子: 5d/10d/20d 动量一致性 + 加速度
 """
 
 import json
@@ -31,8 +34,6 @@ from langgraph.graph import StateGraph, END
 
 from .base_strategy import BreadFreeStrategy
 from ..utils.llm_client import async_hunyuan_chat, parse_llm_response
-from ..utils.metrics import calculate_efficiency_metrics, stable_linear_regression
-from ..utils.portfolio import normalize_weights
 from ..utils.logger import get_logger
 from ..data.market_intel import MarketIntel
 
@@ -61,97 +62,61 @@ def _n(symbol: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 量化引擎：多周期因子计算
+# 量化引擎
 # ═══════════════════════════════════════════════════════════════
 
-def compute_advanced_metrics(history: List[float], lookback: int = 20) -> Optional[Dict]:
-    """计算多周期高级因子 — 提供 5d/10d/20d 三个维度的动量和效率"""
+def compute_metrics(history: List[float], lookback: int = 20) -> Optional[Dict]:
     if len(history) < lookback + 10:
         return None
     prices = np.array(history[-(lookback + 10):])
-    current = prices[-lookback:]
+    cur = prices[-lookback:]
     prev = prices[-(lookback + 5):-5]
-
-    if current[0] <= 0 or prev[0] <= 0:
+    if cur[0] <= 0 or prev[0] <= 0:
         return None
 
-    # 多周期动量
-    mom_20d = current[-1] / current[0] - 1
-    mom_10d = current[-1] / current[-10] - 1 if len(current) >= 10 else mom_20d
-    mom_5d = current[-1] / current[-5] - 1 if len(current) >= 5 else mom_20d
-    prev_mom = prev[-1] / prev[0] - 1
-    mom_accel = mom_20d - prev_mom
+    mom_20d = cur[-1] / cur[0] - 1
+    mom_10d = cur[-1] / cur[-10] - 1 if len(cur) >= 10 else mom_20d
+    mom_5d = cur[-1] / cur[-5] - 1 if len(cur) >= 5 else mom_20d
+    mom_accel = mom_20d - (prev[-1] / prev[0] - 1)
 
-    returns = np.diff(current) / current[:-1]
-    volatility = float(np.std(returns)) if len(returns) > 1 else 0.0
+    rets = np.diff(cur) / cur[:-1]
+    vol = float(np.std(rets)) if len(rets) > 1 else 0.0
 
-    x = np.arange(len(current))
     try:
-        slope, intercept, r_value, _, _ = stats.linregress(x, current)
-        r2 = r_value ** 2
+        slope, _, r_val, _, _ = stats.linregress(np.arange(len(cur)), cur)
+        r2 = r_val ** 2
     except Exception:
         slope, r2 = 0.0, 0.0
 
-    epsilon = 1e-6
-    period_vol = volatility * np.sqrt(len(returns)) + epsilon
-    efficiency = (mom_20d / period_vol) * r2
-
-    dd_from_high = current[-1] / np.max(current) - 1
-
-    # 动量一致性: 5d/10d/20d 同向为强信号
-    mom_alignment = sum(1 for m in [mom_5d, mom_10d, mom_20d] if m > 0) / 3.0
+    period_vol = vol * np.sqrt(len(rets)) + 1e-6
+    eff = (mom_20d / period_vol) * r2
+    dd_high = cur[-1] / np.max(cur) - 1
+    alignment = sum(1 for m in [mom_5d, mom_10d, mom_20d] if m > 0) / 3.0
 
     return {
-        "momentum_5d": float(mom_5d),
-        "momentum_10d": float(mom_10d),
-        "momentum_20d": float(mom_20d),
-        "momentum_accel": float(mom_accel),
-        "volatility": float(volatility),
-        "r2": float(r2),
-        "efficiency": float(efficiency),
-        "close": float(current[-1]),
-        "drawdown_from_high": float(dd_from_high),
-        "trend_slope": float(slope),
-        "momentum_alignment": float(mom_alignment),
+        "momentum_5d": float(mom_5d), "momentum_10d": float(mom_10d),
+        "momentum_20d": float(mom_20d), "momentum_accel": float(mom_accel),
+        "volatility": float(vol), "r2": float(r2), "efficiency": float(eff),
+        "close": float(cur[-1]), "drawdown_from_high": float(dd_high),
+        "trend_slope": float(slope), "momentum_alignment": float(alignment),
     }
 
 
-def classify_regime(all_metrics: Dict[str, Dict]) -> str:
-    if not all_metrics:
-        return "unknown"
-    efficiencies = [m["efficiency"] for m in all_metrics.values()]
-    momentums = [m["momentum_20d"] for m in all_metrics.values()]
-    alignments = [m["momentum_alignment"] for m in all_metrics.values()]
-    pct_positive = sum(1 for m in momentums if m > 0.01) / len(momentums)
-    avg_eff = np.mean(efficiencies)
-    avg_align = np.mean(alignments)
-
-    if pct_positive >= 0.6 and avg_eff > 0.5 and avg_align > 0.6:
-        return "strong_bull"
-    elif pct_positive >= 0.45 and max(efficiencies) > 1.0:
-        return "selective_bull"
-    elif pct_positive <= 0.25:
-        return "bear"
-    else:
-        return "choppy"
-
-
 # ═══════════════════════════════════════════════════════════════
-# Prompts — 专业投委会框架
+# Prompts — 量化锚定框架
 # ═══════════════════════════════════════════════════════════════
 
 ANALYST_PROMPT = """\
-你是一位顶级量化策略师,负责从候选池中精选最优ETF/股票构建投资组合。
+你是量化投资策略师。量化引擎已从25只标的中筛选出效率分最高的{top_n}只候选。
+你的任务是在这{top_n}只候选中分配投资权重。
 
-【决策框架】
-1. 效率分(Efficiency)是核心alpha: 衡量"单位风险获取趋势收益的能力"
-2. 动量一致性: 5日/10日/20日动量同向(一致性>0.66)=趋势可信
-3. 动量加速度>0 = 趋势在加强, 应增加配置
-4. R²>0.7 = 趋势线性度高, 可预测性强, 给予更高置信度
-5. 持仓延续性: 当前持仓仍在Top候选中 → 优先保留(减少换手摩擦)
-6. 敢于集中: 当一只标的效率分远超其他(≥1.5倍)时, 可集中配置至60%
+【重要约束】
+- 你只能在下方候选池中分配权重, 不可引入其他标的
+- 总投资比例必须在 85%-95% 之间 (即最多持有15%现金)
+- 单只标的权重范围: 15%-65%
+- 基准配置是等权({base_weight:.0%}每只), 你在此基础上调整
 
-【候选池数据 (近{lookback}日)】
+【候选池及指标 (近{lookback}日)】
 {metrics_table}
 
 【市场情报】
@@ -161,46 +126,42 @@ ANALYST_PROMPT = """\
 【当前持仓】{holdings}
 【上期决策回顾】{last_context}
 
-【任务】从候选池中选择1-{top_n}只标的, 分配权重(总和≤0.95), 输出纯JSON:
+【决策要点】
+- 效率分最高+动量加速度>0+一致性↑↑↑ → 该标的可上调至50-65%
+- 效率分虽高但加速度<0 → 趋势可能衰减, 权重不超过基准
+- 持仓标的仍在候选池中 → 优先保留(降低换手)
+- 全部候选效率分<0.3 → 降低总投资度至85%
+
+【输出】纯JSON, 无其他文字:
 {{
-  "allocations": {{
-    "代码": {{"weight": 0.0-0.95, "conviction": "high/medium/low", "rationale": "30字内理由"}}
-  }},
-  "total_invested": 0.0-0.95,
-  "market_view": "20字内市场判断"
+  "weights": {{"{example_sym}": 0.40, ...}},
+  "reasoning": "20字内决策理由"
 }}"""
 
 RISK_MGR_PROMPT = """\
-你是投委会风险管理官。策略师已提交配置方案,你需要从风险角度审核并微调。
+你是风控管理官。策略师已在量化引擎筛选的候选池内完成权重分配。
+你需要审核并微调权重。
 
 【策略师方案】
-{analyst_proposal}
+{analyst_weights}
 
-【量化数据】
+【候选池数据】
 {metrics_table}
 
 【市场情报】
 {market_intel}
 
-【你的风控框架】
-1. 波动率检查: 日波动率>2.5%的标的, 权重不应超过40%
-2. 动量衰减风险: 加速度<0 且 R²在下降的标的, 建议减仓10-20%
-3. 资金面验证: 策略师重仓标的是否有主力资金流入支撑
-4. 集中度风险: 单一标的>60%时, 需要R²>0.75且加速度>0的双重确认
-5. 回撤保护: 离近期高点>5%的标的, 需要重新评估
+【风控规则】
+1. 波动率>2.5%的标的权重不超过45%
+2. 加速度<-0.02且R²<0.5的标的建议减仓10%
+3. 你只能调整权重, 不可增加新标的
+4. 总投资比例保持 85%-95%
+5. 调整幅度通常在±10%以内
 
-【重要原则】
-- 你不是否决者。好的方案应该认可并放行
-- 只在发现明确量化风险信号时才建议调整
-- 调整幅度通常在±15%以内, 不做大幅改动
-- 输出最终配置权重(考虑佣金后, 总和≤0.95)
-
-【任务】输出风控审核结果(纯JSON):
+【输出】纯JSON:
 {{
-  "final_weights": {{"代码": 0.0-0.95}},
-  "risk_assessment": "30字内风险评估",
-  "adjustments_made": true/false,
-  "risk_score": 1-10
+  "final_weights": {{...}},
+  "risk_note": "15字内"
 }}"""
 
 
@@ -211,7 +172,7 @@ RISK_MGR_PROMPT = """\
 class V2State(TypedDict):
     date: str
     bars: Dict[str, Any]
-    all_metrics: Dict[str, Dict[str, float]]
+    all_metrics: Dict[str, Dict]
     regime: str
     top_candidates: List[str]
     current_holdings: Dict[str, int]
@@ -228,22 +189,6 @@ class V2State(TypedDict):
     llm_calls: List[Dict[str, Any]]
 
 
-def _get_model() -> Optional[str]:
-    config_path = os.path.join(os.path.dirname(__file__), "..", "config.yaml")
-    if not os.path.exists(config_path):
-        return None
-    try:
-        import yaml
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-        llm = cfg.get("llm") or {}
-        active = (llm.get("active") or os.environ.get("LLM_PROVIDER") or "volcano").lower()
-        spec = (llm.get("providers") or {}).get(active) or {}
-        return spec.get("model")
-    except Exception:
-        return None
-
-
 def _clean_json(text: str) -> str:
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
     for prefix in ["```json", "```"]:
@@ -254,92 +199,79 @@ def _clean_json(text: str) -> str:
     return text.strip()
 
 
-# ── Node 1: 量化引擎 (纯计算, 多周期因子) ──
-
 def quant_engine_node(state: V2State) -> dict:
     bars = state["bars"]
-    all_metrics = state.get("all_metrics", {})
+    all_m = state.get("all_metrics", {})
     top_n = state.get("top_n", 3)
     holdings = state.get("current_holdings", {})
 
-    valid = {s: m for s, m in all_metrics.items() if s in bars}
+    valid = {s: m for s, m in all_m.items() if s in bars}
     if not valid:
         return {"top_candidates": [], "regime": "unknown",
                 "metrics_table_str": "", "market_intel_str": ""}
 
-    sorted_syms = sorted(valid, key=lambda s: valid[s]["efficiency"], reverse=True)
-    candidates = sorted_syms[:max(top_n + 2, 6)]
+    ranked = sorted(valid, key=lambda s: valid[s]["efficiency"], reverse=True)
+
+    # 量化锚定: 候选池 = Top-N (+ 仍在 Top-N+2 内的持仓)
+    candidates = ranked[:top_n]
     for s in holdings:
-        if s not in candidates and s in valid:
+        if s in ranked[:top_n + 2] and s not in candidates:
             candidates.append(s)
 
-    # 构建丰富的指标表
     lines = []
     for sym in candidates:
         m = valid[sym]
-        tag = f" ★持仓" if sym in holdings else ""
-        rank = sorted_syms.index(sym) + 1 if sym in sorted_syms else "?"
-        align_str = "↑↑↑" if m["momentum_alignment"] >= 0.9 else ("↑↑" if m["momentum_alignment"] >= 0.6 else "↑↓")
+        tag = " ★持仓" if sym in holdings else ""
+        rank = ranked.index(sym) + 1
+        ali = "↑↑↑" if m["momentum_alignment"] >= 0.9 else ("↑↑" if m["momentum_alignment"] >= 0.6 else "↑↓")
         lines.append(
             f"  #{rank} {_n(sym)}: 效率={m['efficiency']:.2f}, "
-            f"动量20d={m['momentum_20d']:.2%}, 10d={m['momentum_10d']:.2%}, 5d={m['momentum_5d']:.2%}, "
-            f"加速度={m['momentum_accel']:+.2%}, "
-            f"R²={m['r2']:.2f}, 波动={m['volatility']:.2%}, "
-            f"离高点={m['drawdown_from_high']:.2%}, 一致性={align_str}{tag}"
-        )
-    table_str = "\n".join(lines)
+            f"20d={m['momentum_20d']:.2%}, 10d={m['momentum_10d']:.2%}, 5d={m['momentum_5d']:.2%}, "
+            f"加速={m['momentum_accel']:+.2%}, R²={m['r2']:.2f}, "
+            f"波动={m['volatility']:.2%}, 离高点={m['drawdown_from_high']:.2%}, {ali}{tag}")
+    table = "\n".join(lines)
 
     date_ts = pd.Timestamp(state.get("date", ""))
     regime = _intel.get_regime_enhanced(date_ts, valid)
-    intel_str = _intel.generate_intel_summary(date_ts, valid, candidates[:top_n])
+    intel = _intel.generate_intel_summary(date_ts, valid, candidates[:top_n])
 
-    top_named = [_n(s) for s in sorted_syms[:top_n]]
-    logger.info(f"[Quant] regime={regime} top={top_named}\n{table_str}")
+    logger.info(f"[Quant] regime={regime} candidates={[_n(s) for s in candidates]}\n{table}")
     return {"top_candidates": candidates, "regime": regime,
-            "metrics_table_str": table_str, "market_intel_str": intel_str}
+            "metrics_table_str": table, "market_intel_str": intel}
 
-
-# ── Node 2: 策略分析师 (LLM) ──
 
 async def analyst_node(state: V2State) -> dict:
-    if not state.get("top_candidates"):
+    candidates = state.get("top_candidates", [])
+    if not candidates:
         return {"analyst_output": {}, "llm_calls": state.get("llm_calls", [])}
 
-    top_n = state.get("top_n", 3)
+    top_n = len(candidates)
+    base_w = round(0.95 / top_n, 2)
+
     prompt = ANALYST_PROMPT.format(
-        lookback=state.get("lookback", 20),
+        top_n=top_n, lookback=state.get("lookback", 20),
         metrics_table=state["metrics_table_str"],
         market_intel=state.get("market_intel_str", "暂无"),
         regime=state["regime"],
         holdings=state.get("current_holdings") or "无",
         last_context=state.get("last_decision_context") or "首次决策",
-        top_n=top_n,
+        base_weight=base_w,
+        example_sym=candidates[0] if candidates else "510300",
     )
 
-    # 构建 fallback: 按效率分 Top-N 等权
-    all_m = state.get("all_metrics", {})
-    candidates = state["top_candidates"]
-    fb_alloc = {}
-    sel = [s for s in candidates[:top_n] if all_m.get(s, {}).get("efficiency", 0) > 0.1]
-    if sel:
-        w = round(0.95 / len(sel), 2)
-        for sym in sel:
-            fb_alloc[sym] = {"weight": w, "conviction": "medium",
-                             "rationale": "quant fallback"}
-    fallback = {"allocations": fb_alloc,
-                "total_invested": sum(v["weight"] for v in fb_alloc.values()),
-                "market_view": state.get("regime", "unknown")}
+    # fallback = 等权
+    fb_w = {s: base_w for s in candidates}
+    fallback = {"weights": fb_w, "reasoning": "quant fallback 等权"}
 
     llm_calls = list(state.get("llm_calls", []))
     t0 = int(time.time() * 1000)
     try:
         resp, tokens = await async_hunyuan_chat(
-            query="分析候选池并输出配置方案。", prompt=prompt,
-            temperature=0.3, max_tokens=1024, timeout_seconds=60, max_retries=2,
-        )
+            query="在候选池内分配权重。", prompt=prompt,
+            temperature=0.3, max_tokens=512, timeout_seconds=60, max_retries=2)
         lat = int(time.time() * 1000) - t0
         result = parse_llm_response(_clean_json(resp), fallback)
-        used_fb = not result.get("allocations")
+        used_fb = not result.get("weights")
         if used_fb:
             result = fallback
         llm_calls.append({"agent": "analyst", "tokens": tokens,
@@ -351,43 +283,46 @@ async def analyst_node(state: V2State) -> dict:
                           "latency_ms": int(time.time() * 1000) - t0,
                           "error": str(e), "used_fallback": True})
 
-    w = {s: v.get("weight", 0) if isinstance(v, dict) else 0
-         for s, v in result.get("allocations", {}).items()}
+    # 强制约束: 只保留候选池内的标的
+    raw_w = result.get("weights", {})
+    w = {s: max(min(raw_w.get(s, 0), 0.65), 0) for s in candidates}
+    # 补齐: 如果 LLM 漏掉某些候选, 给最低 15%
+    for s in candidates:
+        if w.get(s, 0) < 0.05:
+            w[s] = 0.15
+    total = sum(w.values())
+    if total > 0:
+        scale = min(0.95, max(0.85, total)) / total
+        w = {s: round(v * scale, 4) for s, v in w.items()}
+
     w_named = {_n(s): f"{v:.0%}" for s, v in w.items() if v > 0}
-    logger.info(f"[Analyst] {w_named}")
-    return {"analyst_output": result, "llm_calls": llm_calls}
+    logger.info(f"[Analyst] {w_named} | {result.get('reasoning', '')}")
+    return {"analyst_output": {"weights": w, "reasoning": result.get("reasoning", "")},
+            "llm_calls": llm_calls}
 
-
-# ── Node 3: 风控管理官 (LLM) — 终裁 ──
 
 async def risk_mgr_node(state: V2State) -> dict:
     analyst = state.get("analyst_output", {})
-    allocs = analyst.get("allocations", {})
-
-    if not allocs:
+    a_weights = analyst.get("weights", {})
+    if not a_weights:
         return {"risk_output": {}, "target_weights": {},
                 "llm_calls": state.get("llm_calls", [])}
 
-    analyst_weights = {s: v.get("weight", 0) if isinstance(v, dict) else 0
-                       for s, v in allocs.items()}
-
     prompt = RISK_MGR_PROMPT.format(
-        analyst_proposal=json.dumps(allocs, ensure_ascii=False),
+        analyst_weights=json.dumps({_n(s): f"{v:.0%}" for s, v in a_weights.items()},
+                                   ensure_ascii=False),
         metrics_table=state["metrics_table_str"],
         market_intel=state.get("market_intel_str", "暂无"),
     )
 
-    fallback = {"final_weights": analyst_weights,
-                "risk_assessment": "fallback-直接采纳策略师方案",
-                "adjustments_made": False, "risk_score": 5}
+    fallback = {"final_weights": a_weights, "risk_note": "直接采纳"}
 
     llm_calls = list(state.get("llm_calls", []))
     t0 = int(time.time() * 1000)
     try:
         resp, tokens = await async_hunyuan_chat(
-            query="审核策略师方案并输出最终配置。", prompt=prompt,
-            temperature=0.15, max_tokens=600, timeout_seconds=60, max_retries=2,
-        )
+            query="风控审核并微调权重。", prompt=prompt,
+            temperature=0.15, max_tokens=400, timeout_seconds=60, max_retries=2)
         lat = int(time.time() * 1000) - t0
         result = parse_llm_response(_clean_json(resp), fallback)
         used_fb = not result.get("final_weights")
@@ -402,21 +337,30 @@ async def risk_mgr_node(state: V2State) -> dict:
                           "latency_ms": int(time.time() * 1000) - t0,
                           "error": str(e), "used_fallback": True})
 
-    tw = result.get("final_weights", {})
-    tw = {k: max(v, 0) for k, v in tw.items() if isinstance(v, (int, float))}
+    candidates = set(state.get("top_candidates", []))
+    raw_tw = result.get("final_weights", {})
+
+    # 规范化: 去掉中文名后缀, 只保留候选池标的
+    tw = {}
+    for k, v in raw_tw.items():
+        sym = k.split("-")[0] if "-" in k else k
+        if sym in candidates and isinstance(v, (int, float)):
+            tw[sym] = max(v, 0)
+
+    # 如果 RiskMgr 输出垃圾, 回退到 Analyst 方案
+    if not tw or sum(tw.values()) < 0.5:
+        tw = a_weights
+
     total = sum(tw.values())
     if total > 0.98:
-        scale = 0.95 / total
-        tw = {k: round(v * scale, 4) for k, v in tw.items()}
+        s = 0.95 / total
+        tw = {k: round(v * s, 4) for k, v in tw.items()}
     tw = {k: v for k, v in tw.items() if v >= 0.02}
 
     tw_named = {_n(s): f"{v:.0%}" for s, v in tw.items()}
-    risk_score = result.get("risk_score", "?")
-    logger.info(f"[RiskMgr] Final: {tw_named} | risk_score={risk_score}")
+    logger.info(f"[RiskMgr] {tw_named} | {result.get('risk_note', '')}")
     return {"risk_output": result, "target_weights": tw, "llm_calls": llm_calls}
 
-
-# ── Graph ──
 
 def build_v2_graph():
     wf = StateGraph(V2State)
@@ -435,14 +379,7 @@ def build_v2_graph():
 # ═══════════════════════════════════════════════════════════════
 
 class AgentStrategyV2(BreadFreeStrategy):
-    """
-    V2 多智能体涌现决策系统
-
-    QuantPrep → Analyst (LLM) → RiskMgr (LLM)
-
-    Analyst 提出配置 → RiskMgr 风控终裁
-    LLM 全部失败时自动退化为纯效率轮动
-    """
+    """量化锚定 + LLM 精调: QuantPrep → Analyst → RiskMgr"""
 
     def __init__(self, broker, lookback_period=20, hold_period=20, top_n=3,
                  lot_size=100, graph_timeout_seconds=180, **kwargs):
@@ -459,93 +396,64 @@ class AgentStrategyV2(BreadFreeStrategy):
         self._last_equity = 0.0
 
     def on_bar(self, date, bars):
-        for symbol, bar in bars.items():
-            if symbol not in self.history:
-                self.history[symbol] = []
-            self.history[symbol].append(bar['close'])
-
+        for sym, bar in bars.items():
+            self.history.setdefault(sym, []).append(bar["close"])
         self.days_counter += 1
 
         min_len = self.lookback_period + 10
         if not all(len(self.history.get(s, [])) >= min_len for s in bars):
             return
-
         if self.days_counter % self.hold_period != 0 and self.days_counter > 1:
             return
 
         all_metrics = {}
-        for symbol in bars:
-            m = compute_advanced_metrics(self.history.get(symbol, []), self.lookback_period)
+        for sym in bars:
+            m = compute_metrics(self.history.get(sym, []), self.lookback_period)
             if m:
-                all_metrics[symbol] = m
-
+                all_metrics[sym] = m
         if not all_metrics:
             return
 
-        pos_snapshot = {}
-        for s, p in self.broker.positions.items():
-            pos_snapshot[s] = getattr(p, 'quantity', p) if hasattr(p, 'quantity') else p
+        pos_snap = {s: getattr(p, "quantity", p) for s, p in self.broker.positions.items()}
+        equity = self.broker.cash + sum(
+            qty * float(bars[s]["close"]) for s, qty in pos_snap.items() if s in bars)
 
-        total_equity = self.broker.cash
-        for s, qty in pos_snapshot.items():
-            price = bars.get(s, {}).get('close', 0)
-            if isinstance(price, pd.Series):
-                price = float(price.iloc[0]) if not price.empty else 0
-            total_equity += qty * price
-
-        # 决策记忆: 包含上期收益反馈
-        pnl_str = ""
-        if self._last_equity > 0:
-            period_ret = (total_equity / self._last_equity - 1)
-            pnl_str = f", 本期收益={period_ret:+.2%}"
+        pnl = f", 本期={equity / self._last_equity - 1:+.2%}" if self._last_equity > 0 else ""
 
         state: V2State = {
-            "date": str(date),
-            "bars": bars,
-            "all_metrics": all_metrics,
-            "regime": "",
-            "top_candidates": [],
-            "current_holdings": pos_snapshot,
-            "cash": self.broker.cash,
-            "total_equity": total_equity,
-            "lookback": self.lookback_period,
-            "top_n": self.top_n,
+            "date": str(date), "bars": bars, "all_metrics": all_metrics,
+            "regime": "", "top_candidates": [], "current_holdings": pos_snap,
+            "cash": self.broker.cash, "total_equity": equity,
+            "lookback": self.lookback_period, "top_n": self.top_n,
             "last_decision_context": self.last_decision_context,
-            "metrics_table_str": "",
-            "market_intel_str": "",
-            "analyst_output": {},
-            "risk_output": {},
-            "target_weights": {},
-            "llm_calls": [],
+            "metrics_table_str": "", "market_intel_str": "",
+            "analyst_output": {}, "risk_output": {},
+            "target_weights": {}, "llm_calls": [],
         }
 
-        holdings_named = [_n(s) for s in pos_snapshot.keys()]
-        logger.info(f"\n{'=' * 55}\n[V2] {date} 调仓 | "
-                    f"资产¥{total_equity:,.0f}{pnl_str} | 持仓{holdings_named}")
+        logger.info(f"\n{'=' * 55}\n[V2] {date} | ¥{equity:,.0f}{pnl} | "
+                    f"持仓{[_n(s) for s in pos_snap]}")
 
-        target_weights = {}
+        tw = {}
         try:
             final = self._run_graph(state)
-            target_weights = final.get("target_weights", {})
+            tw = final.get("target_weights", {})
             for c in final.get("llm_calls", []):
                 self._total_llm_calls += 1
                 self._total_llm_tokens += c.get("tokens", 0)
         except Exception as e:
-            logger.error(f"[V2 GRAPH ERROR] {e}")
-            target_weights = self._quant_fallback(all_metrics)
+            logger.error(f"[V2 ERROR] {e}")
+            tw = self._fallback(all_metrics)
 
-        if target_weights:
-            self._execute_trades(date, target_weights, bars, total_equity)
-            tw_str = json.dumps({_n(s): f"{w:.0%}" for s, w in target_weights.items()},
-                                ensure_ascii=False)
+        if tw:
+            self._execute(date, tw, bars, equity)
             self.last_decision_context = (
-                f"上期({str(date)[:10]}): 配置={tw_str}, "
-                f"资产=¥{total_equity:,.0f}{pnl_str}"
-            )
-            self._last_equity = total_equity
+                f"上期({str(date)[:10]}): {json.dumps({_n(s): f'{w:.0%}' for s, w in tw.items()}, ensure_ascii=False)}"
+                f", 资产¥{equity:,.0f}{pnl}")
+            self._last_equity = equity
 
-    def _quant_fallback(self, metrics: Dict) -> Dict[str, float]:
-        valid = {s: m for s, m in metrics.items() if m.get("efficiency", 0) > 0.1}
+    def _fallback(self, metrics: Dict) -> Dict[str, float]:
+        valid = {s: m for s, m in metrics.items() if m.get("efficiency", 0) > 0}
         if not valid:
             return {}
         ranked = sorted(valid, key=lambda s: valid[s]["efficiency"], reverse=True)
@@ -555,8 +463,7 @@ class AgentStrategyV2(BreadFreeStrategy):
 
     def _run_graph(self, state: dict) -> dict:
         async def _go():
-            return await asyncio.wait_for(
-                self.app.ainvoke(state), timeout=self.graph_timeout)
+            return await asyncio.wait_for(self.app.ainvoke(state), timeout=self.graph_timeout)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -564,72 +471,54 @@ class AgentStrategyV2(BreadFreeStrategy):
         if loop and loop.is_running():
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                return pool.submit(asyncio.run, _go()).result(
-                    timeout=self.graph_timeout + 10)
+                return pool.submit(asyncio.run, _go()).result(timeout=self.graph_timeout + 10)
         return asyncio.run(_go())
 
-    def _execute_trades(self, date, tw: Dict[str, float], bars, total_equity: float):
+    def _execute(self, date, tw: Dict[str, float], bars, equity: float):
         if not tw:
             return
-        tw_named = {_n(s): f"{v:.0%}" for s, v in tw.items()}
-        logger.info(f"[EXEC] {tw_named}")
         cr = self.broker.commission_rate
+        logger.info(f"[EXEC] {({_n(s): f'{v:.0%}' for s, v in tw.items()})}")
 
-        # 先卖: 清仓不在目标中的持仓
-        for symbol in list(self.broker.positions.keys()):
-            if tw.get(symbol, 0) == 0:
-                pos = self.broker.positions.get(symbol)
-                if pos is None:
-                    continue
-                qty = getattr(pos, 'quantity', pos)
-                price = bars.get(symbol, {}).get('close', 0)
-                if isinstance(price, pd.Series):
-                    price = float(price.iloc[0]) if not price.empty else 0
+        for sym in list(self.broker.positions.keys()):
+            if tw.get(sym, 0) == 0:
+                pos = self.broker.positions.get(sym)
+                qty = getattr(pos, "quantity", pos) if pos else 0
+                price = float(bars.get(sym, {}).get("close", 0))
                 if qty > 0 and price > 0:
-                    self.broker.sell(date, symbol, price, qty)
-                    logger.info(f"  清仓 {_n(symbol)}: {qty}股")
+                    self.broker.sell(date, sym, price, qty)
 
-        # 减仓: 降低超配持仓
-        for symbol in list(self.broker.positions.keys()):
-            w = tw.get(symbol, 0)
+        for sym in list(self.broker.positions.keys()):
+            w = tw.get(sym, 0)
             if w <= 0:
                 continue
-            pos = self.broker.positions.get(symbol)
-            if not pos:
-                continue
-            cur_qty = getattr(pos, 'quantity', pos)
-            price = bars.get(symbol, {}).get('close', 0)
-            if isinstance(price, pd.Series):
-                price = float(price.iloc[0]) if not price.empty else 0
+            pos = self.broker.positions.get(sym)
+            cur = getattr(pos, "quantity", pos) if pos else 0
+            price = float(bars.get(sym, {}).get("close", 0))
             if price <= 0:
                 continue
-            target_qty = int(total_equity * w / price / self.lot_size) * self.lot_size
-            if cur_qty > target_qty:
-                sell_q = ((cur_qty - target_qty) // self.lot_size) * self.lot_size
+            tgt = int(equity * w / price / self.lot_size) * self.lot_size
+            if cur > tgt:
+                sell_q = ((cur - tgt) // self.lot_size) * self.lot_size
                 if sell_q > 0:
-                    self.broker.sell(date, symbol, price, sell_q)
-                    logger.info(f"  减仓 {_n(symbol)}: -{sell_q}股")
+                    self.broker.sell(date, sym, price, sell_q)
 
-        # 买入: 按权重高低排序, 佣金感知
         cash = self.broker.cash
-        for symbol, weight in sorted(tw.items(), key=lambda x: -x[1]):
-            if weight <= 0 or symbol not in bars:
+        for sym, w in sorted(tw.items(), key=lambda x: -x[1]):
+            if w <= 0 or sym not in bars:
                 continue
-            price = bars[symbol].get('close', 0)
-            if isinstance(price, pd.Series):
-                price = float(price.iloc[0]) if not price.empty else 0
+            price = float(bars[sym].get("close", 0))
             if price <= 0:
                 continue
-            pos = self.broker.positions.get(symbol)
-            cur_qty = getattr(pos, 'quantity', pos) if pos else 0
-            target_qty = int(total_equity * weight / price / self.lot_size) * self.lot_size
-            if target_qty > cur_qty:
-                buy_qty = target_qty - cur_qty
-                cost = buy_qty * price * (1 + cr)
+            pos = self.broker.positions.get(sym)
+            cur = getattr(pos, "quantity", pos) if pos else 0
+            tgt = int(equity * w / price / self.lot_size) * self.lot_size
+            if tgt > cur:
+                buy_q = tgt - cur
+                cost = buy_q * price * (1 + cr)
                 if cost > cash:
-                    buy_qty = int(cash / (price * (1 + cr)) / self.lot_size) * self.lot_size
-                    cost = buy_qty * price * (1 + cr)
-                if buy_qty > 0 and cost <= cash:
-                    self.broker.buy(date, symbol, price, buy_qty)
+                    buy_q = int(cash / (price * (1 + cr)) / self.lot_size) * self.lot_size
+                    cost = buy_q * price * (1 + cr)
+                if buy_q > 0 and cost <= cash:
+                    self.broker.buy(date, sym, price, buy_q)
                     cash -= cost
-                    logger.info(f"  买入 {_n(symbol)}: +{buy_qty}股")
