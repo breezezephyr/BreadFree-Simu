@@ -42,11 +42,11 @@ class RotationStrategy(BreadFreeStrategy):
         use_efficiency: bool = True,
         lot_size: int = 100,
         min_data_ratio: float = 1.5,
-        enable_risk_parity: bool = True,
+        enable_risk_parity: bool = False,
         min_momentum: float = 0.0,
         accel_lookback: int = 5,
-        retention_bonus: float = 0.15,
-        drawdown_circuit_breaker: float = -0.15,
+        retention_bonus: float = 0.05,
+        drawdown_circuit_breaker: float = -0.20,
         **kwargs,
     ):
         """
@@ -211,20 +211,35 @@ class RotationStrategy(BreadFreeStrategy):
     # 仓位权重计算
     # ──────────────────────────────────────────────────────────────
 
-    def _risk_parity_weights(self, symbols: List[str], factor_data: Dict[str, dict]) -> Dict[str, float]:
-        """风险平价: 权重 ∝ 1/volatility (波动率倒数)"""
-        if not self.enable_risk_parity or not symbols:
-            return {s: 1.0 / len(symbols) for s in symbols}
+    def _calc_weights(self, symbols: List[str], factor_data: Dict[str, dict]) -> Dict[str, float]:
+        """混合加权: 50% 等权 + 50% 风险平价, 单仓位上限 60%"""
+        n = len(symbols)
+        if n == 0:
+            return {}
+        equal_w = {s: 1.0 / n for s in symbols}
+
+        if not self.enable_risk_parity:
+            return equal_w
 
         inv_vols = {}
         for s in symbols:
             vol = factor_data.get(s, {}).get("volatility", 0.0)
-            inv_vols[s] = 1.0 / (vol + 1e-6)
+            inv_vols[s] = 1.0 / max(vol, 0.005)  # 波动率下限 0.5%, 防止极低波标的垄断权重
 
-        total = sum(inv_vols.values())
-        if total <= 0:
-            return {s: 1.0 / len(symbols) for s in symbols}
-        return {s: v / total for s, v in inv_vols.items()}
+        inv_total = sum(inv_vols.values())
+        rp_w = {s: v / inv_total for s, v in inv_vols.items()} if inv_total > 0 else equal_w
+
+        # 50/50 混合
+        blended = {s: 0.5 * equal_w[s] + 0.5 * rp_w[s] for s in symbols}
+
+        # 单仓位上限 60%
+        max_w = 0.60
+        capped = {s: min(w, max_w) for s, w in blended.items()}
+        cap_total = sum(capped.values())
+        if cap_total > 0:
+            capped = {s: w / cap_total for s, w in capped.items()}
+
+        return capped
 
     # ──────────────────────────────────────────────────────────────
     # 交易执行
@@ -349,7 +364,7 @@ class RotationStrategy(BreadFreeStrategy):
 
         # 6) 计算权重 & 执行
         if target_symbols:
-            weights = self._risk_parity_weights(target_symbols, factor_data)
+            weights = self._calc_weights(target_symbols, factor_data)
             logger.info(f"目标权重: { {s: f'{w:.2%}' for s, w in weights.items()} }")
             self._execute_rebalance(date, bars, target_symbols, weights)
         else:
