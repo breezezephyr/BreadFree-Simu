@@ -106,6 +106,7 @@ async def async_hunyuan_chat(
         query=None,
         prompt=None,
         model=None,
+        provider=None,
         temperature=0.2, 
         top_p=0.3, 
         max_tokens=4096,
@@ -115,16 +116,12 @@ async def async_hunyuan_chat(
     ):
     """
     通用 LLM 对话接口，支持通过 config.yaml 配置多 provider（nvidia、volcano 等）。
-    
-    实盘增强:
-    - timeout_seconds: 单次调用超时（默认 60s，实盘中避免无限等待）
-    - max_retries: 失败重试次数（默认 2 次，含首次共 3 次尝试）
-    - 每次重试间隔 2s（指数退避可后续优化）
 
     Args:
         query: User query/question
         prompt: System prompt
         model: Model name (uses provider default if not specified)
+        provider: 指定 provider（如 "nvidia" / "volcano"）；不传则用 config 的 llm.active 或环境变量 LLM_PROVIDER
         temperature: Sampling temperature
         top_p: Nucleus sampling parameter
         max_tokens: Maximum tokens in response
@@ -137,8 +134,22 @@ async def async_hunyuan_chat(
     last_error = None
     for attempt in range(1 + max_retries):
         try:
-            # 每次调用时从 config.yaml + 环境变量取当前 LLM 配置
-            provider_name, client_spec = _get_llm_client_config()
+            # 若调用方指定了 provider，则强制使用该 provider；否则用 config + 环境变量
+            if provider is not None:
+                _, providers = _load_llm_config()
+                if provider not in providers:
+                    raise ValueError(f"Unknown provider '{provider}'. Available: {list(providers.keys())}")
+                spec = providers[provider]
+                env_key = spec.get("env_key", "LLM_API_KEY")
+                api_key = os.environ.get(env_key) or os.environ.get("LLM_API_KEY")
+                provider_name = provider
+                client_spec = {
+                    "base_url": spec.get("base_url"),
+                    "model": spec.get("model"),
+                    "api_key": api_key,
+                }
+            else:
+                provider_name, client_spec = _get_llm_client_config()
             api_key = client_spec.get("api_key")
             if not api_key or api_key == "YOUR_API_KEY_HERE":
                 env_key = (_load_llm_config()[1].get(provider_name) or {}).get("env_key", "LLM_API_KEY")
