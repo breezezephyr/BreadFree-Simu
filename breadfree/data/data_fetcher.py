@@ -226,19 +226,21 @@ class DataFetcher:
             return pd.DataFrame()
 
     def fetch_a_stock_daily(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-        """获取 A 股/ETF 日线数据 — 先查缓存, 再走降级链"""
+        """获取 A 股/ETF 日线数据 — CSV 缓存 → 降级链 → 自动持久化到 DB"""
         cache_file = os.path.join(self.data_dir, f"{symbol}_{start_date}_{end_date}.csv")
 
         if os.path.exists(cache_file):
             logger.debug(f"Cache hit: {cache_file}")
             print(f"Loading data from cache: {cache_file}")
-            return pd.read_csv(cache_file, index_col=0, parse_dates=True)
+            df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+            self._persist_to_db(symbol, df)
+            return df
 
         # 降级链: 逐层尝试
         df = pd.DataFrame()
         for source_name, fetch_fn in _FETCH_CHAIN:
             try:
-                time.sleep(0.5 + random.uniform(0, 1))  # 礼貌性延迟
+                time.sleep(0.5 + random.uniform(0, 1))
                 df = fetch_fn(symbol, start_date, end_date)
                 if not df.empty and len(df) >= 5:
                     self._source_stats[source_name]["ok"] += 1
@@ -252,17 +254,28 @@ class DataFetcher:
                 logger.warning(f"[{source_name}] {symbol} failed: {e}")
 
         if not df.empty:
-            # 确保必需列存在
             for col in ["open", "close", "high", "low", "volume"]:
                 if col not in df.columns:
                     df[col] = 0
             df.to_csv(cache_file)
+            self._persist_to_db(symbol, df)
             print(f"Data for {symbol} fetched from data source, {len(df)} records.")
         else:
             logger.error(f"All sources failed for {symbol}")
             print(f"Error: Unable to fetch data for {symbol}. Skipping.")
 
         return df
+
+    def _persist_to_db(self, symbol: str, df: pd.DataFrame):
+        """将获取到的数据持久化到 SQLite (幂等, 后台静默)"""
+        try:
+            from .database import get_db_manager
+            db = get_db_manager()
+            n = db.bulk_upsert_daily(symbol, df)
+            if n > 0:
+                logger.debug(f"Persisted {n} rows to DB for {symbol}")
+        except Exception as e:
+            logger.warning(f"DB persist failed for {symbol}: {e}")
 
     def get_source_stats(self) -> dict:
         """获取各数据源成功/失败统计"""

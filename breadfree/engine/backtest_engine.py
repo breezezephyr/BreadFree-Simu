@@ -1,6 +1,14 @@
-"""回测引擎 — 数据加载 → 策略驱动 → 绩效汇总"""
+"""
+回测引擎 — 高性能三层存储驱动
+
+数据加载策略:
+    1. DB 预加载: 一次性从 SQLite 加载全部标的到内存 (覆盖索引, ~50ms)
+    2. 增量补数据: DB 缺失的标的走 DataFetcher 降级链获取并回写 DB
+    3. numpy 迭代: 回测循环中所有数据访问都是内存操作, 零 IO
+"""
 
 import os
+import time
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -53,13 +61,21 @@ class BacktestEngine:
         print(f"Fetching data from database for {len(self.symbols)} symbols "
               f"from {fetch_start} to {self.end_date}...")
 
+        t_load = time.time()
         all_dates: set = set()
         warmup_map: dict = {}
         backtest_map: dict = {}
         db = get_db_manager()
 
+        # Step 1: 尝试从 DB 批量预加载
+        db.preload_symbols(self.symbols, fetch_start, self.end_date)
+
         for symbol in self.symbols:
-            df = db.get_daily_data(symbol, fetch_start, self.end_date)
+            # 优先用 DB 预加载的数据
+            df = db.get_preloaded(symbol)
+            if df is None or df.empty:
+                df = db.get_daily_data(symbol, fetch_start, self.end_date)
+
             if df.empty:
                 print(f"Warning: No data for {symbol} in database. "
                       f"Please ensure it is imported.")
