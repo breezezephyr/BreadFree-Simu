@@ -1,12 +1,25 @@
-from typing import TypedDict, List, Dict, Any, Optional
-import pandas as pd
-import numpy as np
-import json
-import re
+"""
+EffiAgentRotationStrategy (EffiA) — 量化锚定 LLM 效率轮动
+
+与 AgentStrategyV2 共享"量化选股, LLM 定权"理念, 但架构更轻量:
+    DataPrep: 计算效率分, 筛选 Top-3 候选 + 持仓标的
+    Analyst:  LLM 在候选池内分配权重 (不可引入新标的)
+    RiskMgr:  LLM 风控微调 (不可引入新标的)
+
+改进点:
+    1. 强制多标的输出 (2-3 只), 禁止单标的 100% 集中
+    2. Analyst 输出包含候选池所有标的权重, 避免遗漏
+    3. RiskMgr 输出强制映射到候选代码, 修复标的幻觉
+    4. 佣金感知下单
+"""
+
 import asyncio
+import json
 import time
+from typing import TypedDict, List, Dict, Any
+
 from langgraph.graph import StateGraph, END
-from collections import defaultdict
+
 from .base_strategy import BreadFreeStrategy
 from ..utils.llm_client import async_hunyuan_chat, parse_llm_response
 from ..utils.metrics import calculate_efficiency_metrics
@@ -15,480 +28,340 @@ from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# --- Prompts ---
+# ═══════════════════════════════════════════════════════════════
 
-ANALYST_PROMPT = """
-You are a Senior Quantitative ETF Analyst.
-Your goal is to select the best assets for a "Rotation Strategy" based on provided technical metrics.
-
-Strategy Definition:
-- We want to buy ETFs with high Momentum (Return) and high Trend Stability (Efficiency/R2).
-- We avoid high volatility if the return is not commensurate.
-- You may select **any number of ETFs** (including zero) that you believe are suitable — do not force diversification if only one asset is strong, or go to cash if none are attractive.
-
-Market Data (Top3 Candidates + Current Holdings 20day metrics):
+ANALYST_PROMPT = """\
+你是量化ETF分析师。量化引擎已筛选出效率分最高的候选标的:
 {market_data_summary}
 
-Task:
-1. Analyze the candidates thoroughly. Note: "[HOLDING: qty]" indicates your current position in that asset.
-2. Select the ETFs you believe should be held for the next period (0 to N symbols).
-3. Provide a brief reason for your selection(s) based on the metrics.
+【重要约束】
+- 你只能在上方候选中分配权重, 不可引入其他标的
+- 必须选择至少2只标的, 单只权重不超过60%
+- 总投资 85%-95%, 其余为现金
+- 持仓标的(标记[HOLDING])仍在候选中时优先保留
 
-Output Format (JSON):
+【输出】纯JSON, 为每只候选标的分配权重:
 {{
-    "code1": {{"weight": 0.6, "view": "bullish", "reason": "Consistent trend..."}},
-    "code2": {{"weight": 0.0, "view": "bearish", "reason": "Trend weakening, high volatility..."}}
-}}
-"""
+    "{example}": {{"weight": 0.45, "reason": "15字内"}},
+    ...
+}}"""
 
-RISK_MANAGER_PROMPT = """
-You are a Risk Manager.
-The Analyst has submitted the following analysis: {analyst_proposal}.
+RISK_MGR_PROMPT = """\
+你是风控管理官。审核以下分配方案:
+方案: {analyst_proposal}
+数据: {metrics_summary}
+组合: 现金{cash}, 持仓{positions}
 
-Current Portfolio State:
-- Cash: {cash}
-- Current Holdings: {positions}
+【规则】
+- 只能调整权重, 不可增加新标的
+- 波动率>2.5%的标的权重≤45%
+- 总投资维持85-95%
 
-Task:
-1. Review the analyst's views for each asset provided in the analysis.
-2. Decide final target weights (sum <= 1.0) for the next period.
-3. If an asset has a "bearish" view, you should strongly consider weight 0.0.
-4. You can reduce weights or hold cash if overall market conditions in the analyst's report look risky.
+【输出】纯JSON:
+{{"target_weights": {{"代码": 0.xx}}, "note": "10字内"}}"""
 
-Output Format (JSON):
-{{
-    "target_weights": {{ "code1": 0.4, "code2": 0.0 }},
-    "risk_comment": "Enforced exit on code2 due to bearish outlook...",
-    "approved": true
-}}
-"""
-
-# --- State Definition ---
 
 class AgentState(TypedDict):
     date: str
     bars: Dict[str, Any]
     history_snapshot: Dict[str, List[float]]
     metrics: Dict[str, Dict[str, float]]
-    broker_state: str
+    candidates: List[str]
     cash: float
     positions: Dict[str, Any]
     analyst_output: Dict[str, Any]
     risk_output: Dict[str, Any]
     lot_size: int
     target_weights: Dict[str, float]
-    llm_calls: List[Dict[str, Any]]  # LLM call audit records
+    llm_calls: List[Dict[str, Any]]
 
-# --- Helper Functions (Math) ---
 
-def get_fallback_weights(metrics: Dict[str, Dict[str, float]]) -> Dict[str, float]:
-    if not metrics:
-        return {}
-    valid = {s: m for s, m in metrics.items() if m["efficiency"] > 0}
-    if not valid:
-        return {}
-    sorted_symbols = sorted(valid.keys(), key=lambda x: valid[x]["efficiency"], reverse=True)
-    selected = sorted_symbols[:5]
-    weight = 1.0 / len(selected)
-    return {s: weight for s in selected}
+# ═══════════════════════════════════════════════════════════════
+# Nodes
+# ═══════════════════════════════════════════════════════════════
 
-# --- Nodes ---
-
-def data_prep_node(state: AgentState) -> AgentState:
-    history_snapshot = state.get("history_snapshot", {})
+def data_prep_node(state: AgentState) -> dict:
+    history = state.get("history_snapshot", {})
     positions = state.get("positions", {})
-    
-    metrics_map = {}
-    for symbol, prices in history_snapshot.items():
+
+    metrics = {}
+    for sym, prices in history.items():
         m = calculate_efficiency_metrics(prices, lookback=20)
         if m:
-            metrics_map[symbol] = m
-            
-    # Get top 3 assets by efficiency ranking
-    sorted_symbols = sorted(metrics_map.keys(), key=lambda x: metrics_map[x]["efficiency"], reverse=True)
-    top_3 = sorted_symbols[:3]
+            metrics[sym] = m
 
-    # Get current holdings
-    current_holdings = [s for s, qty in positions.items() if qty > 0]
+    ranked = sorted(metrics.keys(), key=lambda x: metrics[x]["efficiency"], reverse=True)
+    top_3 = ranked[:3]
+    held = [s for s, q in positions.items() if q > 0]
 
-    # Combine and maintain deterministic order (Top3 first, holdings supplement after)
-    selected_symbols = top_3 + [s for s in current_holdings if s not in top_3]
+    # 候选池 = Top-3 + 仍在 Top-5 内的持仓
+    candidates = list(top_3)
+    for s in held:
+        if s in ranked[:5] and s not in candidates:
+            candidates.append(s)
 
-    # Filter metrics (only keep assets that have data in metrics_map)
-    filtered_metrics = {k: metrics_map[k] for k in selected_symbols if k in metrics_map}
+    filtered = {}
+    for s in candidates:
+        if s in metrics:
+            filtered[s] = dict(metrics[s])
+            filtered[s]["is_holding"] = s in held
+            if s in held:
+                filtered[s]["holding_qty"] = positions[s]
 
-    # Add holding markers to metrics
-    for symbol in filtered_metrics:
-        is_holding = symbol in current_holdings
-        filtered_metrics[symbol]["is_current_holding"] = is_holding
-        if is_holding:
-            filtered_metrics[symbol]["holding_qty"] = positions[symbol]
-    
-    logger.info(f"[DataPrep] Identified Top 3: {top_3}, extra holdings: {[s for s in current_holdings if s not in top_3]}")
-    if not filtered_metrics:
-        logger.warning("[DataPrep] No metrics generated")
-    return {"metrics": filtered_metrics}
+    logger.info(f"[DataPrep] candidates={candidates}, held_extra={[s for s in held if s not in top_3]}")
+    return {"metrics": filtered, "candidates": candidates}
 
-async def analyst_agent_node(state: AgentState) -> AgentState:
-    metrics = state["metrics"]
-    if not metrics:
-        logger.info("[Analyst] Empty metrics, returning fallback")
+
+async def analyst_node(state: AgentState) -> dict:
+    metrics = state.get("metrics", {})
+    candidates = state.get("candidates", [])
+    if not metrics or not candidates:
         return {"analyst_output": {}, "llm_calls": state.get("llm_calls", [])}
-    
-    # Sort by Efficiency from high to low to ensure analyst sees the real Top N
-    sorted_metrics_items = sorted(metrics.items(), key=lambda x: x[1].get('efficiency', 0), reverse=True)
-    
-    summary_lines = []
-    for sym, data in sorted_metrics_items:
-        holding_info = f" [HOLDING: {data['holding_qty']}]" if data.get("is_current_holding") else ""
-        line = (f"- {sym}: Return={data['momentum']:.2%}, "
-                f"Vol={data['volatility']:.2%}, "
-                f"R2={data['r2']:.2f}, "
-                f"Efficiency={data['efficiency']:.2f}{holding_info}")
-        summary_lines.append(line)
-    summary_text = "\n".join(summary_lines)
-    logger.info(f"[Analyst] Sorted Market Data Summary:\n{summary_text}")
-    prompt = ANALYST_PROMPT.format(market_data_summary=summary_text)
-    
-    # Build more meaningful fallback
-    fallback = {}
-    fallback_weights = get_fallback_weights(metrics)
-    for s, w in fallback_weights.items():
-        fallback[s] = {"weight": w, "view": "bullish", "reason": "top efficiency"}
-    
-    llm_calls = list(state.get("llm_calls", []))
-    used_fallback = False
-    start_ms = int(time.time() * 1000)
-    try:
-        response, tokens = await async_hunyuan_chat(
-            query="Analyze and select top ETFs.", prompt=prompt,
-            timeout_seconds=60, max_retries=2,
-        )
-        latency_ms = int(time.time() * 1000) - start_ms
-        analyst_decision = parse_llm_response(response, fallback)
-        if response == "" or analyst_decision is fallback:
-            used_fallback = True
-        llm_calls.append({
-            "agent": "analyst", "tokens": tokens, "latency_ms": latency_ms,
-            "prompt_len": len(prompt), "response_len": len(response),
-            "used_fallback": used_fallback,
-        })
-    except Exception as e:
-        latency_ms = int(time.time() * 1000) - start_ms
-        logger.error(f"[Analyst ERROR] {e}")
-        analyst_decision = fallback
-        used_fallback = True
-        llm_calls.append({
-            "agent": "analyst", "tokens": 0, "latency_ms": latency_ms,
-            "error": str(e), "used_fallback": True,
-        })
 
-    # Extract suggested weights for logging
-    proposed = {s: (v.get("weight") if isinstance(v, dict) else 0) for s, v in analyst_decision.items()}
-    logger.info(f"[Analyst] Analysis Complete. Proposed Weights: {proposed}"
-                f"{' (FALLBACK)' if used_fallback else ''}")
-    return {"analyst_output": analyst_decision, "llm_calls": llm_calls}
+    sorted_items = sorted(metrics.items(), key=lambda x: x[1].get("efficiency", 0), reverse=True)
+    lines = []
+    for sym, d in sorted_items:
+        held = f" [HOLDING: {d['holding_qty']}]" if d.get("is_holding") else ""
+        lines.append(f"- {sym}: Return={d['momentum']:.2%}, Vol={d['volatility']:.2%}, "
+                     f"R2={d['r2']:.2f}, Efficiency={d['efficiency']:.2f}{held}")
+    summary = "\n".join(lines)
 
-async def risk_manager_node(state: AgentState) -> AgentState:
-    analyst_output = state.get("analyst_output", {})
-    if not analyst_output:
-        logger.info("[Risk Manager] No analysis -> cash")
-        return {"risk_output": {"target_weights": {}, "approved": True},
-                "target_weights": {},
-                "llm_calls": state.get("llm_calls", [])}
-    
-    prompt = RISK_MANAGER_PROMPT.format(
-        analyst_proposal=json.dumps(analyst_output),
-        cash=f"{state['cash']:.2f}",
-        positions=str(state['positions'])
+    prompt = ANALYST_PROMPT.format(
+        market_data_summary=summary,
+        example=candidates[0] if candidates else "510300",
     )
-    fallback_weights = get_fallback_weights(state.get("metrics", {}))
-    fallback = {"target_weights": fallback_weights, "approved": True}
-    
+
+    n = len(candidates)
+    base_w = round(0.95 / max(n, 2), 2)
+    fb = {s: {"weight": base_w, "reason": "等权 fallback"} for s in candidates}
+
     llm_calls = list(state.get("llm_calls", []))
-    used_fallback = False
-    start_ms = int(time.time() * 1000)
+    t0 = int(time.time() * 1000)
     try:
-        response, tokens = await async_hunyuan_chat(
-            query="Assess risk and allocate weights.", prompt=prompt,
-            timeout_seconds=60, max_retries=2,
-        )
-        latency_ms = int(time.time() * 1000) - start_ms
-        risk_decision = parse_llm_response(response, fallback)
-        if response == "" or risk_decision is fallback:
-            used_fallback = True
-        llm_calls.append({
-            "agent": "risk_manager", "tokens": tokens, "latency_ms": latency_ms,
-            "prompt_len": len(prompt), "response_len": len(response),
-            "used_fallback": used_fallback,
-        })
+        resp, tokens = await async_hunyuan_chat(
+            query="在候选池内分配权重。", prompt=prompt,
+            temperature=0.3, max_tokens=512, timeout_seconds=60, max_retries=2)
+        lat = int(time.time() * 1000) - t0
+        result = parse_llm_response(resp, fb)
+        used_fb = result is fb
+        llm_calls.append({"agent": "analyst", "tokens": tokens,
+                          "latency_ms": lat, "used_fallback": used_fb})
     except Exception as e:
-        latency_ms = int(time.time() * 1000) - start_ms
-        logger.error(f"[Risk ERROR] {e}")
-        risk_decision = fallback
-        used_fallback = True
-        llm_calls.append({
-            "agent": "risk_manager", "tokens": 0, "latency_ms": latency_ms,
-            "error": str(e), "used_fallback": True,
-        })
-        
-    target_weights = risk_decision.get("target_weights", {})
-    if not target_weights or sum(target_weights.values()) <= 0:
-        logger.info("[Risk] Invalid output -> using fallback weights")
-        target_weights = fallback_weights
-        used_fallback = True
-        
-    target_weights = normalize_weights(target_weights)
-    risk_decision["target_weights"] = target_weights
-    logger.info(f"[Risk Final] target_weights={target_weights}"
-                f"{' (FALLBACK)' if used_fallback else ''}")
-    return {"risk_output": risk_decision, "target_weights": target_weights,
-            "llm_calls": llm_calls}
+        logger.error(f"[Analyst ERROR] {e}")
+        result = fb
+        llm_calls.append({"agent": "analyst", "tokens": 0,
+                          "latency_ms": int(time.time() * 1000) - t0,
+                          "error": str(e), "used_fallback": True})
 
-# --- Graph Construction ---
+    # 提取并约束权重: 只保留候选池标的, 单只≤60%, 至少2只有权重
+    cand_set = set(candidates)
+    weights = {}
+    for s, v in result.items():
+        if s in cand_set:
+            w = v.get("weight", 0) if isinstance(v, dict) else (v if isinstance(v, (int, float)) else 0)
+            weights[s] = max(min(float(w), 0.60), 0)
 
-def build_agent_graph():
-    workflow = StateGraph(AgentState)
-    workflow.add_node("data_prep", data_prep_node)
-    workflow.add_node("analyst", analyst_agent_node)
-    workflow.add_node("risk_manager", risk_manager_node)
-    workflow.set_entry_point("data_prep")
-    workflow.add_edge("data_prep", "analyst")
-    workflow.add_edge("analyst", "risk_manager")
-    workflow.add_edge("risk_manager", END)
-    return workflow.compile()
+    # 确保至少2只标的有权重
+    if sum(1 for w in weights.values() if w > 0.05) < 2:
+        weights = {s: base_w for s in candidates}
 
-# --- Strategy Class ---
+    total = sum(weights.values())
+    if total > 0:
+        scale = min(0.95, max(0.85, total)) / total
+        weights = {s: round(v * scale, 4) for s, v in weights.items() if v > 0}
+
+    logger.info(f"[Analyst] {weights}")
+    return {"analyst_output": weights, "llm_calls": llm_calls}
+
+
+async def risk_mgr_node(state: AgentState) -> dict:
+    a_weights = state.get("analyst_output", {})
+    candidates = state.get("candidates", [])
+    if not a_weights:
+        return {"risk_output": {}, "target_weights": {},
+                "llm_calls": state.get("llm_calls", [])}
+
+    metrics = state.get("metrics", {})
+    lines = []
+    for s in candidates:
+        if s in metrics:
+            d = metrics[s]
+            lines.append(f"{s}: Eff={d['efficiency']:.2f} Vol={d['volatility']:.2%}")
+    metrics_str = "; ".join(lines)
+
+    prompt = RISK_MGR_PROMPT.format(
+        analyst_proposal=json.dumps(a_weights),
+        metrics_summary=metrics_str,
+        cash=f"{state['cash']:.0f}",
+        positions=str(state["positions"]),
+    )
+
+    fallback = {"target_weights": a_weights, "note": "直接采纳"}
+
+    llm_calls = list(state.get("llm_calls", []))
+    t0 = int(time.time() * 1000)
+    try:
+        resp, tokens = await async_hunyuan_chat(
+            query="风控审核。", prompt=prompt,
+            temperature=0.15, max_tokens=300, timeout_seconds=60, max_retries=2)
+        lat = int(time.time() * 1000) - t0
+        result = parse_llm_response(resp, fallback)
+        used_fb = not result.get("target_weights")
+        if used_fb:
+            result = fallback
+        llm_calls.append({"agent": "risk_mgr", "tokens": tokens,
+                          "latency_ms": lat, "used_fallback": used_fb})
+    except Exception as e:
+        logger.error(f"[RiskMgr ERROR] {e}")
+        result = fallback
+        llm_calls.append({"agent": "risk_mgr", "tokens": 0,
+                          "latency_ms": int(time.time() * 1000) - t0,
+                          "error": str(e), "used_fallback": True})
+
+    raw = result.get("target_weights", {})
+    cand_set = set(candidates)
+    tw = {}
+    for k, v in raw.items():
+        sym = k.split("-")[0] if "-" in k else k
+        if sym in cand_set and isinstance(v, (int, float)):
+            tw[sym] = max(v, 0)
+
+    if not tw or sum(tw.values()) < 0.5:
+        tw = a_weights
+
+    tw = normalize_weights(tw)
+    logger.info(f"[RiskMgr] {tw} | {result.get('note', '')}")
+    return {"risk_output": result, "target_weights": tw, "llm_calls": llm_calls}
+
+
+def build_graph():
+    wf = StateGraph(AgentState)
+    wf.add_node("data_prep", data_prep_node)
+    wf.add_node("analyst", analyst_node)
+    wf.add_node("risk_mgr", risk_mgr_node)
+    wf.set_entry_point("data_prep")
+    wf.add_edge("data_prep", "analyst")
+    wf.add_edge("analyst", "risk_mgr")
+    wf.add_edge("risk_mgr", END)
+    return wf.compile()
+
+
+# ═══════════════════════════════════════════════════════════════
+# Strategy Class
+# ═══════════════════════════════════════════════════════════════
 
 class EffiAgentRotationStrategy(BreadFreeStrategy):
-    """
-    LLM Multi-Agent Efficiency Rotation Strategy.
-
-    Uses LangGraph to orchestrate:
-    1. DataPrep -> 2. Analyst Agent (LLM) -> 3. Risk Manager Agent (LLM)
-
-    Live-trading enhancements (Phase 5):
-    - Graph execution timeout (default 180s) to avoid indefinite blocking
-    - LLM call-level timeout + retry (delegated to llm_client)
-    - Fallback to rule-based weights when all LLM calls fail
-    - Structured LLM call records for audit logging
-    - Proper async handling for both backtest and live event loops
-    """
+    """量化锚定 LLM 效率轮动"""
 
     def __init__(self, broker, lookback_period=20, hold_period=20, lot_size=100,
                  graph_timeout_seconds=180, audit_logger=None, **kwargs):
-        """
-        :param graph_timeout_seconds: Max seconds for the entire agent graph execution
-        :param audit_logger: Optional AuditLogger instance for LLM call recording
-        """
         super().__init__(broker, lot_size=lot_size)
         self.lookback_period = lookback_period
         self.hold_period = hold_period
         self.days_counter = 0
-        self.graph_timeout_seconds = graph_timeout_seconds
+        self.graph_timeout = graph_timeout_seconds
         self.audit_logger = audit_logger
-        self.app = build_agent_graph()
-        # Track cumulative LLM stats
+        self.app = build_graph()
         self._total_llm_calls = 0
         self._total_llm_tokens = 0
-        self._total_llm_fallbacks = 0
-        
-    def on_bar(self, date, bars):
-        for symbol, bar in bars.items():
-            if symbol not in self.history:
-                self.history[symbol] = []
-            self.history[symbol].append(bar['close'])
-        self.days_counter += 1
-        
-        not_ready_symbols = [s for s in self.broker_positions_and_pool(bars) if len(self.history.get(s, [])) < self.lookback_period]
-        data_ready = len(not_ready_symbols) == 0
-        
-        if not data_ready:
-            logger.info(f"Data not ready on {date}. Missing lookback for: {not_ready_symbols}")
-            return
+        self._total_fallbacks = 0
 
+    def on_bar(self, date, bars):
+        for sym, bar in bars.items():
+            self.history.setdefault(sym, []).append(bar["close"])
+        self.days_counter += 1
+
+        pool = list(set(list(self.broker.positions.keys()) + list(bars.keys())))
+        if any(len(self.history.get(s, [])) < self.lookback_period for s in pool):
+            return
         if self.days_counter % self.hold_period != 0 and self.days_counter > 1:
             return
-            
-        logger.info(f"LangGraph Agents Triggered on {date}")
-        
-        history_snapshot = {s: list(self.history[s]) for s in bars.keys()}
-        pos_snapshot = {s: getattr(self.broker.positions[s], 'quantity', self.broker.positions[s])
-                        if s in self.broker.positions else 0
-                        for s in self.broker.positions}
-        
-        initial_state = {
-            "date": str(date),
-            "bars": bars,
-            "history_snapshot": history_snapshot,
-            "metrics": {},
-            "cash": self.broker.cash,
-            "positions": pos_snapshot,
-            "analyst_output": {},
-            "risk_output": {},
-            "lot_size": self.lot_size,
-            "target_weights": {},
+
+        logger.info(f"[EffiA] {date}")
+
+        pos_snap = {s: getattr(self.broker.positions[s], "quantity",
+                                self.broker.positions[s])
+                    for s in self.broker.positions}
+
+        state = {
+            "date": str(date), "bars": bars,
+            "history_snapshot": {s: list(self.history[s]) for s in bars},
+            "metrics": {}, "candidates": [],
+            "cash": self.broker.cash, "positions": pos_snap,
+            "analyst_output": {}, "risk_output": {},
+            "lot_size": self.lot_size, "target_weights": {},
             "llm_calls": [],
         }
-        
-        graph_start = time.time()
-        final_state = None
+
         try:
-            final_state = self._run_agent_graph(initial_state)
-            graph_elapsed = time.time() - graph_start
-
-            target_weights = final_state.get("target_weights", {})
-            llm_calls = final_state.get("llm_calls", [])
-
-            logger.info(f"[GRAPH DONE] target_weights={target_weights} "
-                        f"graph_time={graph_elapsed:.1f}s llm_calls={len(llm_calls)}")
-            
-            # Audit LLM calls
-            self._audit_llm_calls(llm_calls, date, target_weights)
-
-            self._execute_trades(date, target_weights, bars)
-            
-        except asyncio.TimeoutError:
-            graph_elapsed = time.time() - graph_start
-            logger.error(f"[GRAPH TIMEOUT] Agent graph exceeded {self.graph_timeout_seconds}s "
-                        f"(actual: {graph_elapsed:.1f}s). Using fallback weights.")
-            # Fallback: rule-based weights from metrics
-            fallback_weights = get_fallback_weights(
-                final_state.get("metrics", {}) if final_state else {}
-            )
-            if fallback_weights:
-                from ..utils.portfolio import normalize_weights as _nw
-                fallback_weights = _nw(fallback_weights)
-                logger.info(f"[GRAPH TIMEOUT FALLBACK] weights={fallback_weights}")
-                self._execute_trades(date, fallback_weights, bars)
-            self._total_llm_fallbacks += 1
-            if self.audit_logger:
-                self.audit_logger.log_system_event(
-                    "AGENT_TIMEOUT",
-                    f"Graph timeout after {graph_elapsed:.1f}s on {date}",
-                    level="ERROR")
+            final = self._run(state)
+            tw = final.get("target_weights", {})
+            for c in final.get("llm_calls", []):
+                self._total_llm_calls += 1
+                self._total_llm_tokens += c.get("tokens", 0)
+                if c.get("used_fallback"):
+                    self._total_fallbacks += 1
+            logger.info(f"[EffiA DONE] {tw}")
+            self._trade(date, tw, bars)
         except Exception as e:
-            logger.error(f"[GRAPH ERROR] {e}", exc_info=True)
-            if self.audit_logger:
-                self.audit_logger.log_system_event(
-                    "AGENT_ERROR", f"Graph error on {date}: {e}", level="ERROR")
+            logger.error(f"[EffiA ERROR] {e}", exc_info=True)
 
-    def _run_agent_graph(self, initial_state: dict) -> dict:
-        """
-        Execute the LangGraph agent graph with timeout protection.
-
-        Handles the tricky asyncio situation:
-        - In backtest mode: no event loop running, use asyncio.run()
-        - In live mode: scheduler may have a running loop
-        """
-        async def _run_with_timeout():
-            return await asyncio.wait_for(
-                self.app.ainvoke(initial_state),
-                timeout=self.graph_timeout_seconds,
-            )
-
+    def _run(self, state):
+        async def _go():
+            return await asyncio.wait_for(self.app.ainvoke(state), timeout=self.graph_timeout)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
-
-        if loop is not None and loop.is_running():
-            # We're inside a running event loop (e.g., Jupyter, some live schedulers).
-            # Create a new thread to run the async code.
+        if loop and loop.is_running():
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(asyncio.run, _run_with_timeout())
-                return future.result(timeout=self.graph_timeout_seconds + 10)
-        else:
-            return asyncio.run(_run_with_timeout())
+                return pool.submit(asyncio.run, _go()).result(timeout=self.graph_timeout + 10)
+        return asyncio.run(_go())
 
-    def _audit_llm_calls(self, llm_calls: list, date, target_weights: dict):
-        """Record LLM call details to audit logger if available."""
-        for call in llm_calls:
-            self._total_llm_calls += 1
-            self._total_llm_tokens += call.get("tokens", 0)
-            if call.get("used_fallback"):
-                self._total_llm_fallbacks += 1
-
-            if self.audit_logger:
-                agent = call.get("agent", "unknown")
-                self.audit_logger.log_llm_call(
-                    model=f"agent:{agent}",
-                    prompt_summary=f"{agent} on {date} (prompt_len={call.get('prompt_len', 0)})",
-                    response_summary=f"resp_len={call.get('response_len', 0)}, "
-                                     f"fallback={call.get('used_fallback', False)}",
-                    tokens_used=call.get("tokens", 0),
-                    latency_ms=call.get("latency_ms", 0),
-                )
-
-        # Log overall strategy decision
-        if self.audit_logger:
-            self.audit_logger.log_strategy_decision(
-                strategy_name="EffiAgentRotation",
-                signals=[{"symbol": s, "weight": w} for s, w in target_weights.items()],
-                reasoning=f"date={date}, llm_calls={len(llm_calls)}, "
-                          f"fallbacks={sum(1 for c in llm_calls if c.get('used_fallback'))}",
-            )
-
-    def broker_positions_and_pool(self, current_bars):
-        return list(set(list(self.broker.positions.keys()) + list(current_bars.keys())))
-
-    def _execute_trades(self, date, target_weights: Dict[str, float], bars):
-        if not target_weights:
+    def _trade(self, date, tw: Dict[str, float], bars):
+        if not tw:
             return
 
-        logger.info(f"[EXECUTE] Allocation: {target_weights}")
-        
-        total_asset_value = self.broker.cash
+        total = self.broker.cash
         for s, pos in self.broker.positions.items():
-            price = bars.get(s, {}).get('close', 0)
-            qty = getattr(pos, 'quantity', pos) if hasattr(pos, 'quantity') else pos
-            if price > 0:
-                total_asset_value += qty * price
-                
-        # Sell first
-        current_holdings = list(self.broker.positions.keys())
-        for symbol in current_holdings:
-            pos_obj = self.broker.positions[symbol]
-            current_qty = getattr(pos_obj, 'quantity', pos_obj) if hasattr(pos_obj, 'quantity') else pos_obj
-            price = bars.get(symbol, {}).get('close', 0)
+            p = bars.get(s, {}).get("close", 0)
+            q = getattr(pos, "quantity", pos) if hasattr(pos, "quantity") else pos
+            if p > 0:
+                total += q * p
+
+        cr = self.broker.commission_rate
+
+        for sym in list(self.broker.positions.keys()):
+            pos = self.broker.positions[sym]
+            cur = getattr(pos, "quantity", pos) if hasattr(pos, "quantity") else pos
+            price = bars.get(sym, {}).get("close", 0)
             if price == 0:
                 continue
-            target_pct = target_weights.get(symbol, 0.0)
-            target_val = total_asset_value * target_pct
-            target_qty = int(target_val / price / self.lot_size) * self.lot_size
-            if current_qty > target_qty:
-                sell_qty = current_qty - target_qty
-                self.broker.sell(date, symbol, price, sell_qty)
-                logger.info(f"[SELL] {symbol}: {sell_qty}")
+            tgt_q = int(total * tw.get(sym, 0) / price / self.lot_size) * self.lot_size
+            if cur > tgt_q:
+                self.broker.sell(date, sym, price, cur - tgt_q)
 
-        # Buy after
-        current_cash = self.broker.cash
-        for symbol, weight in target_weights.items():
-            if symbol not in bars:
+        cash = self.broker.cash
+        for sym, w in sorted(tw.items(), key=lambda x: -x[1]):
+            if sym not in bars:
                 continue
-            price = bars[symbol]['close']
-            target_val = total_asset_value * weight
-            pos_obj = self.broker.positions.get(symbol, None)
-            if pos_obj is not None:
-                current_qty = getattr(pos_obj, 'quantity', pos_obj) if hasattr(pos_obj, 'quantity') else pos_obj
-            else:
-                current_qty = 0
-            target_qty = int(target_val / price / self.lot_size) * self.lot_size
-            if target_qty > current_qty:
-                buy_qty = target_qty - current_qty
-                cost = buy_qty * price
-                if current_cash >= cost:
-                    self.broker.buy(date, symbol, price, buy_qty)
-                    current_cash -= cost
-                    logger.info(f"[BUY] {symbol}: {buy_qty}")
-                else:
-                    logger.warning(f"Not enough cash to buy {symbol}")
+            price = bars[sym]["close"]
+            if price <= 0:
+                continue
+            pos = self.broker.positions.get(sym)
+            cur = getattr(pos, "quantity", pos) if pos and hasattr(pos, "quantity") else (pos or 0)
+            tgt_q = int(total * w / price / self.lot_size) * self.lot_size
+            if tgt_q > cur:
+                buy_q = tgt_q - cur
+                cost = buy_q * price * (1 + cr)
+                if cost > cash:
+                    buy_q = int(cash / (price * (1 + cr)) / self.lot_size) * self.lot_size
+                    cost = buy_q * price * (1 + cr)
+                if buy_q > 0 and cost <= cash:
+                    self.broker.buy(date, sym, price, buy_q)
+                    cash -= cost
 
     def get_llm_stats(self) -> dict:
-        """Get cumulative LLM usage statistics."""
-        return {
-            "total_llm_calls": self._total_llm_calls,
-            "total_llm_tokens": self._total_llm_tokens,
-            "total_fallbacks": self._total_llm_fallbacks,
-        }
+        return {"calls": self._total_llm_calls, "tokens": self._total_llm_tokens,
+                "fallbacks": self._total_fallbacks}

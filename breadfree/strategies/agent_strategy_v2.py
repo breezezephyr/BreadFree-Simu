@@ -1,15 +1,22 @@
 """
-AgentStrategyV2 — 多智能体涌现决策系统
+AgentStrategyV2 — 量化锚定 + LLM 精调决策系统
 
-架构：Quant Engine → Bull Analyst (LLM) → Bear Challenger (LLM) → Portfolio Manager (LLM)
+核心理念: "量化选股, LLM 定权"
+    QuantPrep 选出 Top-N 候选 (不可更改)
+    Analyst LLM 在 Top-N 内分配权重 (可集中/分散, 但不能引入新标的)
+    RiskMgr LLM 微调权重 (可减仓+留现金, 但不能引入新标的)
 
-核心设计：
-  1. 辩证决策：Bull 提出配置方案 → Bear 挑战寻找风险盲点 → PM 综合裁决
-     三方博弈产生涌现智能，避免单一视角偏见
-  2. 量化增强：效率分 + 动量加速度 + 趋势政权分类 → 为 LLM 提供结构化信号
-  3. 零人为约束：不硬编码仓位上限/现金缓冲，完全由 Agent 辩论决定
-  4. 动量持续性：持仓仍在 Top-N 时，降低换手摩擦
-  5. 健壮 fallback：任何 LLM 失败自动退化为纯效率轮动
+为何不让 LLM 自由选股:
+    - 效率分/动量等量化因子已高度提炼 alpha 信号
+    - LLM 自由选股会引入"防御偏差"(过度配置债券/红利), 拖累趋势收益
+    - LLM 的真正价值在于: 理解因子间微妙关系, 做出更精准的权重分配
+
+架构改进 (V2.1):
+    1. 量化锚定: LLM 只能在 QuantPrep 的 Top-N 内分配权重
+    2. 基准权重: 提供等权基准, LLM 在此基础上调整 ±20%
+    3. 最低投资度: 总投资比例不低于 85% (杜绝过度保守)
+    4. 决策记忆: 传递上期收益反馈, 形成学习闭环
+    5. 多周期因子: 5d/10d/20d 动量一致性 + 加速度
 """
 
 import json
@@ -27,8 +34,6 @@ from langgraph.graph import StateGraph, END
 
 from .base_strategy import BreadFreeStrategy
 from ..utils.llm_client import async_hunyuan_chat, parse_llm_response
-from ..utils.metrics import calculate_efficiency_metrics, stable_linear_regression
-from ..utils.portfolio import normalize_weights
 from ..utils.logger import get_logger
 from ..data.market_intel import MarketIntel
 
@@ -38,7 +43,6 @@ _intel = MarketIntel()
 
 
 def _load_etf_names() -> Dict[str, str]:
-    """从 config.yaml 加载 ETF 代码→中文名称映射"""
     config_path = os.path.join(os.path.dirname(__file__), "..", "config.yaml")
     try:
         import yaml
@@ -53,84 +57,66 @@ _ETF_NAMES: Dict[str, str] = _load_etf_names()
 
 
 def _n(symbol: str) -> str:
-    """代码 → '代码-中文名' 格式，如 '510300-沪深300ETF'"""
     name = _ETF_NAMES.get(symbol, "")
     return f"{symbol}-{name}" if name else symbol
 
 
 # ═══════════════════════════════════════════════════════════════
-# 量化引擎：计算高级因子
+# 量化引擎
 # ═══════════════════════════════════════════════════════════════
 
-def compute_advanced_metrics(history: List[float], lookback: int = 20) -> Optional[Dict]:
-    if len(history) < lookback + 5:
+def compute_metrics(history: List[float], lookback: int = 20) -> Optional[Dict]:
+    if len(history) < lookback + 10:
         return None
-    prices = np.array(history[-(lookback + 5):])
-    current_window = prices[-lookback:]
-    prev_window = prices[-(lookback + 5):-(5)]
-
-    if current_window[0] <= 0 or prev_window[0] <= 0:
+    prices = np.array(history[-(lookback + 10):])
+    cur = prices[-lookback:]
+    prev = prices[-(lookback + 5):-5]
+    if cur[0] <= 0 or prev[0] <= 0:
         return None
 
-    momentum = current_window[-1] / current_window[0] - 1
-    prev_momentum = prev_window[-1] / prev_window[0] - 1
-    momentum_accel = momentum - prev_momentum
+    mom_20d = cur[-1] / cur[0] - 1
+    mom_10d = cur[-1] / cur[-10] - 1 if len(cur) >= 10 else mom_20d
+    mom_5d = cur[-1] / cur[-5] - 1 if len(cur) >= 5 else mom_20d
+    mom_accel = mom_20d - (prev[-1] / prev[0] - 1)
 
-    returns = np.diff(current_window) / current_window[:-1]
-    volatility = float(np.std(returns)) if len(returns) > 1 else 0.0
+    rets = np.diff(cur) / cur[:-1]
+    vol = float(np.std(rets)) if len(rets) > 1 else 0.0
 
-    x = np.arange(len(current_window))
     try:
-        slope, intercept, r_value, _, _ = stats.linregress(x, current_window)
-        r2 = r_value ** 2
+        slope, _, r_val, _, _ = stats.linregress(np.arange(len(cur)), cur)
+        r2 = r_val ** 2
     except Exception:
         slope, r2 = 0.0, 0.0
 
-    epsilon = 1e-6
-    period_vol = volatility * np.sqrt(len(returns)) + epsilon
-    efficiency = (momentum / period_vol) * r2
-
-    drawdown_from_high = (current_window[-1] / np.max(current_window) - 1)
+    period_vol = vol * np.sqrt(len(rets)) + 1e-6
+    eff = (mom_20d / period_vol) * r2
+    dd_high = cur[-1] / np.max(cur) - 1
+    alignment = sum(1 for m in [mom_5d, mom_10d, mom_20d] if m > 0) / 3.0
 
     return {
-        "momentum": float(momentum),
-        "momentum_accel": float(momentum_accel),
-        "volatility": float(volatility),
-        "r2": float(r2),
-        "efficiency": float(efficiency),
-        "close": float(current_window[-1]),
-        "drawdown_from_high": float(drawdown_from_high),
-        "trend_slope": float(slope),
+        "momentum_5d": float(mom_5d), "momentum_10d": float(mom_10d),
+        "momentum_20d": float(mom_20d), "momentum_accel": float(mom_accel),
+        "volatility": float(vol), "r2": float(r2), "efficiency": float(eff),
+        "close": float(cur[-1]), "drawdown_from_high": float(dd_high),
+        "trend_slope": float(slope), "momentum_alignment": float(alignment),
     }
 
 
-def classify_regime(all_metrics: Dict[str, Dict]) -> str:
-    if not all_metrics:
-        return "unknown"
-    efficiencies = [m["efficiency"] for m in all_metrics.values()]
-    momentums = [m["momentum"] for m in all_metrics.values()]
-    pct_positive_mom = sum(1 for m in momentums if m > 0.01) / len(momentums)
-    avg_eff = np.mean(efficiencies)
-    max_eff = max(efficiencies)
-
-    if pct_positive_mom >= 0.6 and avg_eff > 0.5:
-        return "strong_bull"
-    elif pct_positive_mom >= 0.4 and max_eff > 1.0:
-        return "selective_bull"
-    elif pct_positive_mom <= 0.3:
-        return "bear"
-    else:
-        return "choppy"
-
-
 # ═══════════════════════════════════════════════════════════════
-# Prompts — Bull/Bear/PM 三方辩证
+# Prompts — 量化锚定框架
 # ═══════════════════════════════════════════════════════════════
 
-BULL_ANALYST_PROMPT = """\
-你是一位进攻型 ETF 轮动策略师，目标是捕捉最强趋势获取最大收益。
+ANALYST_PROMPT = """\
+你是量化投资策略师。量化引擎已从25只标的中筛选出效率分最高的{top_n}只候选。
+你的任务是在这{top_n}只候选中分配投资权重。
 
-【量化指标（近{lookback}日）】
+【重要约束】
+- 你只能在下方候选池中分配权重, 不可引入其他标的
+- 总投资比例必须在 85%-95% 之间 (即最多持有15%现金)
+- 单只标的权重范围: 15%-65%
+- 基准配置是等权({base_weight:.0%}每只), 你在此基础上调整
+
+【候选池及指标 (近{lookback}日)】
 {metrics_table}
 
 【市场情报】
@@ -138,83 +124,44 @@ BULL_ANALYST_PROMPT = """\
 
 【市场政权】{regime}
 【当前持仓】{holdings}
-【上期回顾】{last_context}
+【上期决策回顾】{last_context}
 
-【你的投资哲学】
-- 效率分（Efficiency）是核心：衡量"每单位风险的趋势收益质量"
-- 效率分 > 1.5 且 R² > 0.7 = 强趋势确认，应重仓出击
-- 动量加速度 > 0 = 趋势在加强，加大配置
-- 当一只 ETF 的效率分远超其他（≥2倍），应果断集中配置
-- 持仓 ETF 仍在 Top-3 → 优先保留（减少换手摩擦）
+【决策要点】
+- 效率分最高+动量加速度>0+一致性↑↑↑ → 该标的可上调至50-65%
+- 效率分虽高但加速度<0 → 趋势可能衰减, 权重不超过基准
+- 持仓标的仍在候选池中 → 优先保留(降低换手)
+- 全部候选效率分<0.3 → 降低总投资度至85%
 
-【任务】输出目标配置方案（纯JSON，不要任何其他文字）：
+【输出】纯JSON, 无其他文字:
 {{
-  "allocations": {{
-    "代码": {{"weight": 0.0-1.0, "conviction": "high/medium/low", "bull_case": "..."}}
-  }},
-  "total_invested": 0.0-1.0,
-  "regime_view": "..."
+  "weights": {{"{example_sym}": 0.40, ...}},
+  "reasoning": "20字内决策理由"
 }}"""
 
-BEAR_CHALLENGER_PROMPT = """\
-你是一位风险挑战者。你的职责不是阻止交易，而是找出 Bull 方案的盲点，让最终决策更稳健。
+RISK_MGR_PROMPT = """\
+你是风控管理官。策略师已在量化引擎筛选的候选池内完成权重分配。
+你需要审核并微调权重。
 
-【Bull 方案】
-{bull_proposal}
+【策略师方案】
+{analyst_weights}
 
-【量化数据】
+【候选池数据】
 {metrics_table}
 
 【市场情报】
 {market_intel}
 
-【你的审查框架】
-1. 集中度风险：单一资产 > 80% 时，检查其 R² 是否 > 0.75 且动量加速度 > 0
-2. 趋势衰退：动量加速度 < 0 的资产是否被过度配置
-3. 波动率异常：日波动率 > 2% 的资产需要额外风险溢价
-4. 资金面验证：Bull重仓的ETF是否有主力资金流入支撑？北向资金方向与配置方向一致吗？
-4. 持仓惯性：是否因为"已经持有"而忽略了更优选择
+【风控规则】
+1. 波动率>2.5%的标的权重不超过45%
+2. 加速度<-0.02且R²<0.5的标的建议减仓10%
+3. 你只能调整权重, 不可增加新标的
+4. 总投资比例保持 85%-95%
+5. 调整幅度通常在±10%以内
 
-【重要原则】
-- 你不是看空一切。如果 Bull 方案有强量化支撑，你应该认可并可能建议加仓
-- 只有在发现明确风险信号时才建议减仓
-- 你的调整幅度通常在 ±20% 以内
-
-【任务】输出你的挑战意见和调整建议（纯JSON）：
+【输出】纯JSON:
 {{
-  "challenges": [
-    {{"asset": "代码", "issue": "风险描述", "severity": "high/medium/low"}}
-  ],
-  "adjusted_weights": {{"代码": 0.0-1.0}},
-  "bear_view": "整体风险评估",
-  "agrees_with_bull": true/false
-}}"""
-
-PORTFOLIO_MANAGER_PROMPT = """\
-你是首席投资官(CIO)，拥有最终裁决权。你收到了 Bull 和 Bear 两方的分析。
-
-【Bull 方案】
-{bull_proposal}
-
-【Bear 挑战】
-{bear_response}
-
-【量化数据】
-{metrics_table}
-
-【裁决原则】
-1. 如果 Bull/Bear 一致看好某资产 → 满配该资产
-2. 如果 Bear 提出了有数据支撑的高严重性风险 → 适度减仓（但不清仓强趋势资产）
-3. 如果 Bear 的挑战缺乏量化依据 → 维持 Bull 方案
-4. 宁可错过也不要做错：只配置有明确趋势的资产
-5. 交易成本意识：与当前持仓差异 < 10% 时保持不变
-
-【任务】输出最终配置（纯JSON）：
-{{
-  "final_weights": {{"代码": 0.0-1.0}},
-  "reasoning": "裁决逻辑",
-  "bull_score": 0-10,
-  "bear_score": 0-10
+  "final_weights": {{...}},
+  "risk_note": "15字内"
 }}"""
 
 
@@ -225,7 +172,7 @@ PORTFOLIO_MANAGER_PROMPT = """\
 class V2State(TypedDict):
     date: str
     bars: Dict[str, Any]
-    all_metrics: Dict[str, Dict[str, float]]
+    all_metrics: Dict[str, Dict]
     regime: str
     top_candidates: List[str]
     current_holdings: Dict[str, int]
@@ -236,27 +183,10 @@ class V2State(TypedDict):
     last_decision_context: str
     metrics_table_str: str
     market_intel_str: str
-    bull_output: Dict[str, Any]
-    bear_output: Dict[str, Any]
-    pm_output: Dict[str, Any]
+    analyst_output: Dict[str, Any]
+    risk_output: Dict[str, Any]
     target_weights: Dict[str, float]
     llm_calls: List[Dict[str, Any]]
-
-
-def _get_model() -> Optional[str]:
-    config_path = os.path.join(os.path.dirname(__file__), "..", "config.yaml")
-    if not os.path.exists(config_path):
-        return None
-    try:
-        import yaml
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-        llm = cfg.get("llm") or {}
-        active = (llm.get("active") or os.environ.get("LLM_PROVIDER") or "volcano").lower()
-        spec = (llm.get("providers") or {}).get(active) or {}
-        return spec.get("model")
-    except Exception:
-        return None
 
 
 def _clean_json(text: str) -> str:
@@ -269,227 +199,178 @@ def _clean_json(text: str) -> str:
     return text.strip()
 
 
-# ── Node 1: 量化引擎 (纯计算) ──
-
 def quant_engine_node(state: V2State) -> dict:
     bars = state["bars"]
-    all_metrics = state.get("all_metrics", {})
+    all_m = state.get("all_metrics", {})
     top_n = state.get("top_n", 3)
     holdings = state.get("current_holdings", {})
 
-    valid = {s: m for s, m in all_metrics.items() if s in bars}
+    valid = {s: m for s, m in all_m.items() if s in bars}
     if not valid:
-        return {"top_candidates": [], "regime": "unknown", "metrics_table_str": "", "market_intel_str": ""}
+        return {"top_candidates": [], "regime": "unknown",
+                "metrics_table_str": "", "market_intel_str": ""}
 
-    sorted_syms = sorted(valid, key=lambda s: valid[s]["efficiency"], reverse=True)
-    candidates = sorted_syms[:max(top_n + 2, 5)]
+    ranked = sorted(valid, key=lambda s: valid[s]["efficiency"], reverse=True)
+
+    # 量化锚定: 候选池 = Top-N (+ 仍在 Top-N+2 内的持仓)
+    candidates = ranked[:top_n]
     for s in holdings:
-        if s not in candidates and s in valid:
+        if s in ranked[:top_n + 2] and s not in candidates:
             candidates.append(s)
 
     lines = []
     for sym in candidates:
         m = valid[sym]
-        tag = f" ★持仓{holdings[sym]}股" if sym in holdings else ""
-        rank = sorted_syms.index(sym) + 1 if sym in sorted_syms else "?"
+        tag = " ★持仓" if sym in holdings else ""
+        rank = ranked.index(sym) + 1
+        ali = "↑↑↑" if m["momentum_alignment"] >= 0.9 else ("↑↑" if m["momentum_alignment"] >= 0.6 else "↑↓")
         lines.append(
             f"  #{rank} {_n(sym)}: 效率={m['efficiency']:.2f}, "
-            f"动量={m['momentum']:.2%}, 加速度={m['momentum_accel']:+.2%}, "
-            f"R²={m['r2']:.2f}, 波动={m['volatility']:.2%}, "
-            f"离高点={m['drawdown_from_high']:.2%}{tag}"
-        )
-    table_str = "\n".join(lines)
+            f"20d={m['momentum_20d']:.2%}, 10d={m['momentum_10d']:.2%}, 5d={m['momentum_5d']:.2%}, "
+            f"加速={m['momentum_accel']:+.2%}, R²={m['r2']:.2f}, "
+            f"波动={m['volatility']:.2%}, 离高点={m['drawdown_from_high']:.2%}, {ali}{tag}")
+    table = "\n".join(lines)
 
     date_ts = pd.Timestamp(state.get("date", ""))
     regime = _intel.get_regime_enhanced(date_ts, valid)
-    intel_str = _intel.generate_intel_summary(date_ts, valid, candidates[:top_n])
+    intel = _intel.generate_intel_summary(date_ts, valid, candidates[:top_n])
 
-    top_named = [_n(s) for s in sorted_syms[:top_n]]
-    logger.info(f"[Quant] regime={regime} top={top_named}\n{table_str}\n{intel_str}")
+    logger.info(f"[Quant] regime={regime} candidates={[_n(s) for s in candidates]}\n{table}")
     return {"top_candidates": candidates, "regime": regime,
-            "metrics_table_str": table_str, "market_intel_str": intel_str}
+            "metrics_table_str": table, "market_intel_str": intel}
 
 
-# ── Node 2: Bull Analyst (LLM) ──
+async def analyst_node(state: V2State) -> dict:
+    candidates = state.get("top_candidates", [])
+    if not candidates:
+        return {"analyst_output": {}, "llm_calls": state.get("llm_calls", [])}
 
-async def bull_node(state: V2State) -> dict:
-    if not state.get("top_candidates"):
-        return {"bull_output": {}, "llm_calls": state.get("llm_calls", [])}
+    top_n = len(candidates)
+    base_w = round(0.95 / top_n, 2)
 
-    prompt = BULL_ANALYST_PROMPT.format(
-        lookback=state.get("lookback", 20),
+    prompt = ANALYST_PROMPT.format(
+        top_n=top_n, lookback=state.get("lookback", 20),
         metrics_table=state["metrics_table_str"],
         market_intel=state.get("market_intel_str", "暂无"),
         regime=state["regime"],
         holdings=state.get("current_holdings") or "无",
-        last_context=state.get("last_decision_context") or "首次",
+        last_context=state.get("last_decision_context") or "首次决策",
+        base_weight=base_w,
+        example_sym=candidates[0] if candidates else "510300",
     )
 
-    all_m = state.get("all_metrics", {})
-    top_n = state.get("top_n", 3)
-    candidates = state["top_candidates"]
-    fb_alloc = {}
-    for sym in candidates[:top_n]:
-        m = all_m.get(sym, {})
-        if m.get("efficiency", 0) > 0.2:
-            fb_alloc[sym] = {"weight": round(0.95 / min(len(candidates), top_n), 2),
-                             "conviction": "medium", "bull_case": "quant fallback"}
-    fallback = {"allocations": fb_alloc, "total_invested": sum(v["weight"] for v in fb_alloc.values()),
-                "regime_view": state["regime"]}
+    # fallback = 等权
+    fb_w = {s: base_w for s in candidates}
+    fallback = {"weights": fb_w, "reasoning": "quant fallback 等权"}
 
     llm_calls = list(state.get("llm_calls", []))
     t0 = int(time.time() * 1000)
     try:
         resp, tokens = await async_hunyuan_chat(
-            query="分析并提出ETF配置方案。", prompt=prompt,
-            temperature=0.3, max_tokens=1024, timeout_seconds=60, max_retries=2,
-        )
+            query="在候选池内分配权重。", prompt=prompt,
+            temperature=0.3, max_tokens=512, timeout_seconds=60, max_retries=2)
         lat = int(time.time() * 1000) - t0
         result = parse_llm_response(_clean_json(resp), fallback)
-        used_fb = not result.get("allocations")
+        used_fb = not result.get("weights")
         if used_fb:
             result = fallback
-        llm_calls.append({"agent": "bull", "tokens": tokens, "latency_ms": lat, "used_fallback": used_fb})
+        llm_calls.append({"agent": "analyst", "tokens": tokens,
+                          "latency_ms": lat, "used_fallback": used_fb})
     except Exception as e:
-        logger.error(f"[Bull ERROR] {e}")
+        logger.error(f"[Analyst ERROR] {e}")
         result = fallback
-        llm_calls.append({"agent": "bull", "tokens": 0, "latency_ms": int(time.time()*1000)-t0,
+        llm_calls.append({"agent": "analyst", "tokens": 0,
+                          "latency_ms": int(time.time() * 1000) - t0,
                           "error": str(e), "used_fallback": True})
 
-    w = {s: v.get("weight", 0) if isinstance(v, dict) else 0 for s, v in result.get("allocations", {}).items()}
-    w_named = {_n(s): v for s, v in w.items()}
-    logger.info(f"[Bull] Proposed: {w_named}")
-    return {"bull_output": result, "llm_calls": llm_calls}
+    # 强制约束: 只保留候选池内的标的
+    raw_w = result.get("weights", {})
+    w = {s: max(min(raw_w.get(s, 0), 0.65), 0) for s in candidates}
+    # 补齐: 如果 LLM 漏掉某些候选, 给最低 15%
+    for s in candidates:
+        if w.get(s, 0) < 0.05:
+            w[s] = 0.15
+    total = sum(w.values())
+    if total > 0:
+        scale = min(0.95, max(0.85, total)) / total
+        w = {s: round(v * scale, 4) for s, v in w.items()}
+
+    w_named = {_n(s): f"{v:.0%}" for s, v in w.items() if v > 0}
+    logger.info(f"[Analyst] {w_named} | {result.get('reasoning', '')}")
+    return {"analyst_output": {"weights": w, "reasoning": result.get("reasoning", "")},
+            "llm_calls": llm_calls}
 
 
-# ── Node 3: Bear Challenger (LLM) ──
-
-async def bear_node(state: V2State) -> dict:
-    bull = state.get("bull_output", {})
-    allocs = bull.get("allocations", {})
-    if not allocs:
-        return {"bear_output": {"agrees_with_bull": True, "adjusted_weights": {}},
+async def risk_mgr_node(state: V2State) -> dict:
+    analyst = state.get("analyst_output", {})
+    a_weights = analyst.get("weights", {})
+    if not a_weights:
+        return {"risk_output": {}, "target_weights": {},
                 "llm_calls": state.get("llm_calls", [])}
 
-    prompt = BEAR_CHALLENGER_PROMPT.format(
-        bull_proposal=json.dumps(allocs, ensure_ascii=False),
+    prompt = RISK_MGR_PROMPT.format(
+        analyst_weights=json.dumps({_n(s): f"{v:.0%}" for s, v in a_weights.items()},
+                                   ensure_ascii=False),
         metrics_table=state["metrics_table_str"],
         market_intel=state.get("market_intel_str", "暂无"),
     )
 
-    bull_weights = {s: v.get("weight", 0) if isinstance(v, dict) else 0 for s, v in allocs.items()}
-    fallback = {"challenges": [], "adjusted_weights": bull_weights,
-                "bear_view": "No significant risks found", "agrees_with_bull": True}
+    fallback = {"final_weights": a_weights, "risk_note": "直接采纳"}
 
     llm_calls = list(state.get("llm_calls", []))
     t0 = int(time.time() * 1000)
     try:
         resp, tokens = await async_hunyuan_chat(
-            query="审查Bull方案并提出挑战。", prompt=prompt,
-            temperature=0.2, max_tokens=800, timeout_seconds=60, max_retries=2,
-        )
-        lat = int(time.time() * 1000) - t0
-        result = parse_llm_response(_clean_json(resp), fallback)
-        used_fb = False
-        if not result.get("adjusted_weights"):
-            result["adjusted_weights"] = bull_weights
-            used_fb = True
-        llm_calls.append({"agent": "bear", "tokens": tokens, "latency_ms": lat, "used_fallback": used_fb})
-    except Exception as e:
-        logger.error(f"[Bear ERROR] {e}")
-        result = fallback
-        llm_calls.append({"agent": "bear", "tokens": 0, "latency_ms": int(time.time()*1000)-t0,
-                          "error": str(e), "used_fallback": True})
-
-    challenges = result.get("challenges", [])
-    agrees = result.get("agrees_with_bull", True)
-    adj_named = {_n(s): v for s, v in result.get("adjusted_weights", {}).items()}
-    logger.info(f"[Bear] agrees={agrees}, challenges={len(challenges)}, adjusted={adj_named}")
-    return {"bear_output": result, "llm_calls": llm_calls}
-
-
-# ── Node 4: Portfolio Manager (LLM) — 最终裁决 ──
-
-async def pm_node(state: V2State) -> dict:
-    bull = state.get("bull_output", {})
-    bear = state.get("bear_output", {})
-    allocs = bull.get("allocations", {})
-
-    if not allocs:
-        return {"pm_output": {}, "target_weights": {}, "llm_calls": state.get("llm_calls", [])}
-
-    bull_weights = {s: v.get("weight", 0) if isinstance(v, dict) else 0 for s, v in allocs.items()}
-    bear_weights = bear.get("adjusted_weights", bull_weights)
-    agrees = bear.get("agrees_with_bull", True)
-
-    if agrees and not bear.get("challenges"):
-        tw = {k: v for k, v in bull_weights.items() if v > 0}
-        total = sum(tw.values())
-        if total > 0.98:
-            scale = 0.95 / total
-            tw = {k: round(v * scale, 4) for k, v in tw.items()}
-        tw_named = {_n(s): v for s, v in tw.items()}
-        logger.info(f"[PM] Bull/Bear consensus → direct approve: {tw_named}")
-        return {"pm_output": {"final_weights": tw, "reasoning": "bull_bear_consensus"},
-                "target_weights": tw, "llm_calls": state.get("llm_calls", [])}
-
-    prompt = PORTFOLIO_MANAGER_PROMPT.format(
-        bull_proposal=json.dumps(allocs, ensure_ascii=False),
-        bear_response=json.dumps(bear, ensure_ascii=False),
-        metrics_table=state["metrics_table_str"],
-    )
-
-    fallback_w = {}
-    for s in set(list(bull_weights.keys()) + list(bear_weights.keys())):
-        fallback_w[s] = (bull_weights.get(s, 0) * 0.6 + bear_weights.get(s, 0) * 0.4)
-    fallback = {"final_weights": fallback_w, "reasoning": "weighted_fallback",
-                "bull_score": 6, "bear_score": 4}
-
-    llm_calls = list(state.get("llm_calls", []))
-    t0 = int(time.time() * 1000)
-    try:
-        resp, tokens = await async_hunyuan_chat(
-            query="裁决Bull和Bear的分歧，输出最终配置。", prompt=prompt,
-            temperature=0.2, max_tokens=600, timeout_seconds=60, max_retries=2,
-        )
+            query="风控审核并微调权重。", prompt=prompt,
+            temperature=0.15, max_tokens=400, timeout_seconds=60, max_retries=2)
         lat = int(time.time() * 1000) - t0
         result = parse_llm_response(_clean_json(resp), fallback)
         used_fb = not result.get("final_weights")
         if used_fb:
             result = fallback
-        llm_calls.append({"agent": "pm", "tokens": tokens, "latency_ms": lat, "used_fallback": used_fb})
+        llm_calls.append({"agent": "risk_mgr", "tokens": tokens,
+                          "latency_ms": lat, "used_fallback": used_fb})
     except Exception as e:
-        logger.error(f"[PM ERROR] {e}")
+        logger.error(f"[RiskMgr ERROR] {e}")
         result = fallback
-        llm_calls.append({"agent": "pm", "tokens": 0, "latency_ms": int(time.time()*1000)-t0,
+        llm_calls.append({"agent": "risk_mgr", "tokens": 0,
+                          "latency_ms": int(time.time() * 1000) - t0,
                           "error": str(e), "used_fallback": True})
 
-    tw = result.get("final_weights", {})
-    tw = {k: max(v, 0) for k, v in tw.items() if isinstance(v, (int, float))}
+    candidates = set(state.get("top_candidates", []))
+    raw_tw = result.get("final_weights", {})
+
+    # 规范化: 去掉中文名后缀, 只保留候选池标的
+    tw = {}
+    for k, v in raw_tw.items():
+        sym = k.split("-")[0] if "-" in k else k
+        if sym in candidates and isinstance(v, (int, float)):
+            tw[sym] = max(v, 0)
+
+    # 如果 RiskMgr 输出垃圾, 回退到 Analyst 方案
+    if not tw or sum(tw.values()) < 0.5:
+        tw = a_weights
+
     total = sum(tw.values())
     if total > 0.98:
-        scale = 0.95 / total
-        tw = {k: round(v * scale, 4) for k, v in tw.items()}
-    tw = {k: v for k, v in tw.items() if v >= 0.03}
+        s = 0.95 / total
+        tw = {k: round(v * s, 4) for k, v in tw.items()}
+    tw = {k: v for k, v in tw.items() if v >= 0.02}
 
-    tw_named = {_n(s): v for s, v in tw.items()}
-    logger.info(f"[PM] Final: {tw_named} | bull={result.get('bull_score')}/bear={result.get('bear_score')}")
-    return {"pm_output": result, "target_weights": tw, "llm_calls": llm_calls}
+    tw_named = {_n(s): f"{v:.0%}" for s, v in tw.items()}
+    logger.info(f"[RiskMgr] {tw_named} | {result.get('risk_note', '')}")
+    return {"risk_output": result, "target_weights": tw, "llm_calls": llm_calls}
 
-
-# ── Graph ──
 
 def build_v2_graph():
     wf = StateGraph(V2State)
     wf.add_node("quant_engine", quant_engine_node)
-    wf.add_node("bull", bull_node)
-    wf.add_node("bear", bear_node)
-    wf.add_node("pm", pm_node)
+    wf.add_node("analyst", analyst_node)
+    wf.add_node("risk_mgr", risk_mgr_node)
     wf.set_entry_point("quant_engine")
-    wf.add_edge("quant_engine", "bull")
-    wf.add_edge("bull", "bear")
-    wf.add_edge("bear", "pm")
-    wf.add_edge("pm", END)
+    wf.add_edge("quant_engine", "analyst")
+    wf.add_edge("analyst", "risk_mgr")
+    wf.add_edge("risk_mgr", END)
     return wf.compile()
 
 
@@ -498,14 +379,7 @@ def build_v2_graph():
 # ═══════════════════════════════════════════════════════════════
 
 class AgentStrategyV2(BreadFreeStrategy):
-    """
-    V2 多智能体辩证决策系统
-
-    Quant Engine → Bull Analyst → Bear Challenger → Portfolio Manager
-
-    Bull/Bear 一致时跳过 PM（节省 1 次 LLM 调用）
-    LLM 全部失败时自动退化为纯效率轮动
-    """
+    """量化锚定 + LLM 精调: QuantPrep → Analyst → RiskMgr"""
 
     def __init__(self, broker, lookback_period=20, hold_period=20, top_n=3,
                  lot_size=100, graph_timeout_seconds=180, **kwargs):
@@ -519,85 +393,67 @@ class AgentStrategyV2(BreadFreeStrategy):
         self.last_decision_context = ""
         self._total_llm_calls = 0
         self._total_llm_tokens = 0
+        self._last_equity = 0.0
 
     def on_bar(self, date, bars):
-        for symbol, bar in bars.items():
-            if symbol not in self.history:
-                self.history[symbol] = []
-            self.history[symbol].append(bar['close'])
-
+        for sym, bar in bars.items():
+            self.history.setdefault(sym, []).append(bar["close"])
         self.days_counter += 1
 
-        min_len = self.lookback_period + 5
+        min_len = self.lookback_period + 10
         if not all(len(self.history.get(s, [])) >= min_len for s in bars):
             return
-
         if self.days_counter % self.hold_period != 0 and self.days_counter > 1:
             return
 
         all_metrics = {}
-        for symbol in bars:
-            m = compute_advanced_metrics(self.history.get(symbol, []), self.lookback_period)
+        for sym in bars:
+            m = compute_metrics(self.history.get(sym, []), self.lookback_period)
             if m:
-                all_metrics[symbol] = m
-
+                all_metrics[sym] = m
         if not all_metrics:
             return
 
-        pos_snapshot = {}
-        for s, p in self.broker.positions.items():
-            pos_snapshot[s] = getattr(p, 'quantity', p) if hasattr(p, 'quantity') else p
+        pos_snap = {s: getattr(p, "quantity", p) for s, p in self.broker.positions.items()}
+        equity = self.broker.cash + sum(
+            qty * float(bars[s]["close"]) for s, qty in pos_snap.items() if s in bars)
 
-        total_equity = self.broker.cash
-        for s, qty in pos_snapshot.items():
-            price = bars.get(s, {}).get('close', 0)
-            if isinstance(price, pd.Series):
-                price = float(price.iloc[0]) if not price.empty else 0
-            total_equity += qty * price
+        pnl = f", 本期={equity / self._last_equity - 1:+.2%}" if self._last_equity > 0 else ""
 
         state: V2State = {
-            "date": str(date),
-            "bars": bars,
-            "all_metrics": all_metrics,
-            "regime": "",
-            "top_candidates": [],
-            "current_holdings": pos_snapshot,
-            "cash": self.broker.cash,
-            "total_equity": total_equity,
-            "lookback": self.lookback_period,
-            "top_n": self.top_n,
+            "date": str(date), "bars": bars, "all_metrics": all_metrics,
+            "regime": "", "top_candidates": [], "current_holdings": pos_snap,
+            "cash": self.broker.cash, "total_equity": equity,
+            "lookback": self.lookback_period, "top_n": self.top_n,
             "last_decision_context": self.last_decision_context,
-            "metrics_table_str": "",
-            "market_intel_str": "",
-            "bull_output": {},
-            "bear_output": {},
-            "pm_output": {},
-            "target_weights": {},
-            "llm_calls": [],
+            "metrics_table_str": "", "market_intel_str": "",
+            "analyst_output": {}, "risk_output": {},
+            "target_weights": {}, "llm_calls": [],
         }
 
-        holdings_named = [_n(s) for s in pos_snapshot.keys()]
-        logger.info(f"\n{'='*55}\n[V2] {date} 调仓 | 资产¥{total_equity:,.0f} | 持仓{holdings_named}")
+        logger.info(f"\n{'=' * 55}\n[V2] {date} | ¥{equity:,.0f}{pnl} | "
+                    f"持仓{[_n(s) for s in pos_snap]}")
 
-        target_weights = {}
+        tw = {}
         try:
             final = self._run_graph(state)
-            target_weights = final.get("target_weights", {})
+            tw = final.get("target_weights", {})
             for c in final.get("llm_calls", []):
                 self._total_llm_calls += 1
                 self._total_llm_tokens += c.get("tokens", 0)
         except Exception as e:
-            logger.error(f"[V2 GRAPH ERROR] {e}")
-            target_weights = self._quant_fallback(all_metrics)
+            logger.error(f"[V2 ERROR] {e}")
+            tw = self._fallback(all_metrics)
 
-        if target_weights:
-            self._execute_trades(date, target_weights, bars, total_equity)
+        if tw:
+            self._execute(date, tw, bars, equity)
             self.last_decision_context = (
-                f"上期({str(date)[:10]}): 配置={json.dumps(target_weights)}, 资产=¥{total_equity:,.0f}"
-            )
+                f"上期({str(date)[:10]}): {json.dumps({_n(s): f'{w:.0%}' for s, w in tw.items()}, ensure_ascii=False)}"
+                f", 资产¥{equity:,.0f}{pnl}")
+            self._last_equity = equity
 
-    def _quant_fallback(self, metrics: Dict) -> Dict[str, float]:
-        valid = {s: m for s, m in metrics.items() if m.get("efficiency", 0) > 0.2}
+    def _fallback(self, metrics: Dict) -> Dict[str, float]:
+        valid = {s: m for s, m in metrics.items() if m.get("efficiency", 0) > 0}
         if not valid:
             return {}
         ranked = sorted(valid, key=lambda s: valid[s]["efficiency"], reverse=True)
@@ -607,8 +463,7 @@ class AgentStrategyV2(BreadFreeStrategy):
 
     def _run_graph(self, state: dict) -> dict:
         async def _go():
-            return await asyncio.wait_for(
-                self.app.ainvoke(state), timeout=self.graph_timeout)
+            return await asyncio.wait_for(self.app.ainvoke(state), timeout=self.graph_timeout)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -619,65 +474,51 @@ class AgentStrategyV2(BreadFreeStrategy):
                 return pool.submit(asyncio.run, _go()).result(timeout=self.graph_timeout + 10)
         return asyncio.run(_go())
 
-    def _execute_trades(self, date, tw: Dict[str, float], bars, total_equity: float):
+    def _execute(self, date, tw: Dict[str, float], bars, equity: float):
         if not tw:
             return
-        tw_named = {_n(s): v for s, v in tw.items()}
-        logger.info(f"[EXEC] {tw_named}")
         cr = self.broker.commission_rate
+        logger.info(f"[EXEC] {({_n(s): f'{v:.0%}' for s, v in tw.items()})}")
 
-        for symbol in list(self.broker.positions.keys()):
-            if tw.get(symbol, 0) == 0:
-                pos = self.broker.positions.get(symbol)
-                if pos is None:
-                    continue
-                qty = getattr(pos, 'quantity', pos)
-                price = bars.get(symbol, {}).get('close', 0)
-                if isinstance(price, pd.Series):
-                    price = float(price.iloc[0]) if not price.empty else 0
+        for sym in list(self.broker.positions.keys()):
+            if tw.get(sym, 0) == 0:
+                pos = self.broker.positions.get(sym)
+                qty = getattr(pos, "quantity", pos) if pos else 0
+                price = float(bars.get(sym, {}).get("close", 0))
                 if qty > 0 and price > 0:
-                    self.broker.sell(date, symbol, price, qty)
-                    logger.info(f"  SELL ALL {_n(symbol)}: {qty}股")
+                    self.broker.sell(date, sym, price, qty)
 
-        for symbol in list(self.broker.positions.keys()):
-            w = tw.get(symbol, 0)
+        for sym in list(self.broker.positions.keys()):
+            w = tw.get(sym, 0)
             if w <= 0:
                 continue
-            pos = self.broker.positions.get(symbol)
-            if not pos:
-                continue
-            cur_qty = getattr(pos, 'quantity', pos)
-            price = bars.get(symbol, {}).get('close', 0)
-            if isinstance(price, pd.Series):
-                price = float(price.iloc[0]) if not price.empty else 0
+            pos = self.broker.positions.get(sym)
+            cur = getattr(pos, "quantity", pos) if pos else 0
+            price = float(bars.get(sym, {}).get("close", 0))
             if price <= 0:
                 continue
-            target_qty = int(total_equity * w / price / self.lot_size) * self.lot_size
-            if cur_qty > target_qty:
-                sell_q = ((cur_qty - target_qty) // self.lot_size) * self.lot_size
+            tgt = int(equity * w / price / self.lot_size) * self.lot_size
+            if cur > tgt:
+                sell_q = ((cur - tgt) // self.lot_size) * self.lot_size
                 if sell_q > 0:
-                    self.broker.sell(date, symbol, price, sell_q)
-                    logger.info(f"  REDUCE {_n(symbol)}: -{sell_q}股")
+                    self.broker.sell(date, sym, price, sell_q)
 
         cash = self.broker.cash
-        for symbol, weight in sorted(tw.items(), key=lambda x: -x[1]):
-            if weight <= 0 or symbol not in bars:
+        for sym, w in sorted(tw.items(), key=lambda x: -x[1]):
+            if w <= 0 or sym not in bars:
                 continue
-            price = bars[symbol].get('close', 0)
-            if isinstance(price, pd.Series):
-                price = float(price.iloc[0]) if not price.empty else 0
+            price = float(bars[sym].get("close", 0))
             if price <= 0:
                 continue
-            pos = self.broker.positions.get(symbol)
-            cur_qty = getattr(pos, 'quantity', pos) if pos else 0
-            target_qty = int(total_equity * weight / price / self.lot_size) * self.lot_size
-            if target_qty > cur_qty:
-                buy_qty = target_qty - cur_qty
-                cost = buy_qty * price * (1 + cr)
+            pos = self.broker.positions.get(sym)
+            cur = getattr(pos, "quantity", pos) if pos else 0
+            tgt = int(equity * w / price / self.lot_size) * self.lot_size
+            if tgt > cur:
+                buy_q = tgt - cur
+                cost = buy_q * price * (1 + cr)
                 if cost > cash:
-                    buy_qty = int(cash / (price * (1 + cr)) / self.lot_size) * self.lot_size
-                    cost = buy_qty * price * (1 + cr)
-                if buy_qty > 0 and cost <= cash:
-                    self.broker.buy(date, symbol, price, buy_qty)
+                    buy_q = int(cash / (price * (1 + cr)) / self.lot_size) * self.lot_size
+                    cost = buy_q * price * (1 + cr)
+                if buy_q > 0 and cost <= cash:
+                    self.broker.buy(date, sym, price, buy_q)
                     cash -= cost
-                    logger.info(f"  BUY {_n(symbol)}: +{buy_qty}股")

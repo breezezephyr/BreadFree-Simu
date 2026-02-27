@@ -244,10 +244,10 @@ class MarketIntel:
         if not all_metrics:
             return {}
 
-        momentums = [m["momentum"] for m in all_metrics.values()]
+        momentums = [m.get("momentum_20d", m.get("momentum", 0)) for m in all_metrics.values()]
         efficiencies = [m["efficiency"] for m in all_metrics.values()]
         accels = [m.get("momentum_accel", 0) for m in all_metrics.values()]
-        vols = [m["volatility"] for m in all_metrics.values()]
+        vols = [m.get("volatility", 0) for m in all_metrics.values()]
         n = len(momentums)
 
         pct_up = sum(1 for m in momentums if m > 0.005) / n

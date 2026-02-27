@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
-"""
-BreadFree 全策略回测分析脚本
-运行所有非LLM策略，生成综合收益报告
-"""
+"""全策略回测分析 — 运行所有非LLM策略, 生成综合收益报告"""
+
 import sys
 import os
-import json
 import time
-from datetime import datetime, timedelta
-from io import StringIO
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import pandas as pd
-import numpy as np
 import yaml
 
 from breadfree.engine.backtest_engine import BacktestEngine

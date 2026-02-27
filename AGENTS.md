@@ -34,6 +34,20 @@ Available strategies: `RotationStrategy`, `BenchmarkStrategy`, `DoubleMAStrategy
 
 Without these, `AgentStrategyV2` and `EffiA` will fail with 404. Pure quant strategies (`RotationStrategy`, `BenchmarkStrategy`, etc.) work without any secrets.
 
+### Strategy architecture (V2)
+
+```
+RotationStrategy (纯量化):  多因子效率分 → Top-N 选股 → 等权/风险平价加权
+AgentStrategyV2  (LLM辩证): QuantEngine → Bull Analyst → Bear Challenger → PM 裁决
+EffiA            (LLM轮动): QuantPrep → Analyst Agent → RiskMgr Agent
+```
+
+`RotationStrategy` 是核心量化策略, 多因子合成:
+- `efficiency = (momentum / period_vol) * R²` — 风险调整后的趋势质量
+- `accel = current_mom - lagged_mom` — 动量加速度 (趋势增强加分)
+- `drawdown_penalty` — 远离近期高点的标的降权
+- 支持 `retention_bonus` (降低换手摩擦)、`drawdown_circuit_breaker` (回撤熔断)
+
 ### Key caveats
 
 - **No linting/formatting config**: Use `python -m py_compile <file>` for basic syntax validation.
@@ -44,3 +58,4 @@ Without these, `AgentStrategyV2` and `EffiA` will fail with 404. Pure quant stra
 - **LLM strategies are slow**: `AgentStrategyV2` makes 2-3 LLM calls per rebalance day (~30-50s per rebalance). For a full-year backtest with `hold_period=20`, expect ~12 rebalances = ~10 minutes total.
 - **SQLite databases are file-based**: `breadfree.db` and `live_trading.db` are auto-created. No external database server needed.
 - **`uv` must be on PATH**: Installed to `~/.local/bin`.
+- **Deleted old strategy variants**: `double_ma_strategy.py`, `effi_agent_strategy_signal.py`, `effi_agent_strategy_hold20d.py` have been consolidated. `ma_strategy.py` is the canonical `DoubleMAStrategy`.
