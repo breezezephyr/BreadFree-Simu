@@ -2,14 +2,22 @@
 BreadFree 全策略批量回测对比 — 1年/半年/3个月三时间窗口
 
 用法:
-    uv run python batch_compare.py
+    uv run python batch_compare.py              # 含 LLM 策略（慢）
+    uv run python batch_compare.py --quant-only # 仅纯量化，快速出结果
+
+耗时说明：AgentV2/EffiA 每个调仓日会打 2～3 次 LLM API（约 30～50s/次），
+3 个月 × hold_period=20 ≈ 3 次调仓 × 2 策略 ≈ 6～15 分钟仅 LLM 部分。欲快速对比请用 --quant-only。
 """
 
+import argparse
 import sys, os, time
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ModuleNotFoundError:
+    pass
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import pandas as pd
@@ -27,6 +35,8 @@ from breadfree.strategies.effi_rotation_strategy import RotationStrategy
 from breadfree.strategies.triple_momentum_strategy import TripleMomentumStrategy
 from breadfree.strategies.dynamic_rotation_strategy import DynamicRotationStrategy
 
+from breadfree.utils.llm_client import get_llm_token_sum, reset_llm_token_sum
+
 HAS_LLM = bool(os.getenv("ARK_API_KEY") or os.getenv("NVIDIA_API_KEY"))
 if HAS_LLM:
     from breadfree.strategies.agent_strategy_v2 import AgentStrategyV2
@@ -37,7 +47,7 @@ if HAS_LLM:
 # 策略清单
 # ═══════════════════════════════════════════════════════════════
 
-def build_strategy_list():
+def build_strategy_list(quant_only: bool = False):
     strategies = [
         ("Benchmark (买入持有)",       BenchmarkStrategy, {}),
         ("DoubleMA (双均线交叉)",      DoubleMAStrategy,  {}),
@@ -52,7 +62,7 @@ def build_strategy_list():
         ("DynamicRotation (主动+动态)", DynamicRotationStrategy,
          {"lookback_period": 20, "top_n": 3, "enable_discovery": False}),
     ]
-    if HAS_LLM:
+    if HAS_LLM and not quant_only:
         strategies.extend([
             ("AgentV2 (Bull-Bear辩证)", AgentStrategyV2,
              {"lookback_period": 20, "hold_period": 20, "top_n": 3}),
@@ -166,26 +176,34 @@ def print_table(window_name, rows):
 # ═══════════════════════════════════════════════════════════════
 
 def main():
+    parser = argparse.ArgumentParser(description="BreadFree 全策略批量回测")
+    parser.add_argument("--quant-only", action="store_true", help="仅跑纯量化策略，跳过 AgentV2/EffiA，速度快")
+    args = parser.parse_args()
+
     import yaml
     cfg_path = os.path.join(os.path.dirname(__file__), "breadfree", "config.yaml")
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
     symbols = list(cfg.get("etf_pool", {}).keys())
 
-    strategies = build_strategy_list()
+    strategies = build_strategy_list(quant_only=args.quant_only)
 
     print(f"╔{'═'*60}╗")
     print(f"║  BreadFree 全策略批量回测对比                              ║")
     print(f"║  标的池: {len(symbols)} 个 (ETF+个股)                               ║")
     print(f"║  策略数: {len(strategies)} 个                                          ║")
     print(f"║  时间窗口: 1年 / 半年 / 3个月                              ║")
-    if HAS_LLM:
+    if args.quant_only:
+        print(f"║  --quant-only: 仅纯量化，已跳过 LLM 策略                           ║")
+    elif HAS_LLM:
         print(f"║  ✓ LLM API 可用, 含 AgentV2 + EffiA                       ║")
     else:
         print(f"║  ✗ 无 LLM Key, 跳过 AgentV2 / EffiA                       ║")
     print(f"╚{'═'*60}╝\n")
 
     all_results = {}
+    if HAS_LLM:
+        reset_llm_token_sum()
 
     for w_name, w_start, w_end in WINDOWS:
         print(f"\n{'='*70}")
@@ -237,6 +255,9 @@ def main():
         print()
 
     print(f"\n{'▓'*115}")
+    if HAS_LLM:
+        s = get_llm_token_sum()
+        print(f"  📊 本轮 LLM 跑测 token 消耗: total_tokens={s['total_tokens']}, call_count={s['call_count']}")
     print("  完成!\n")
 
 

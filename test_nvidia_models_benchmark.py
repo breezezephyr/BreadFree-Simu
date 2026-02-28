@@ -9,9 +9,12 @@ import asyncio
 import os
 import sys
 import time
-from dotenv import load_dotenv
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ModuleNotFoundError:
+    pass  # 无 python-dotenv 时跳过，仍可从环境变量读取
 
 if sys.platform == "win32":
     try:

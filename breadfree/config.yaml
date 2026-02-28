@@ -47,29 +47,17 @@ commission_rate: 0.0003
 data_source: "akshare" # "akshare" or "tushare"
 strategy: "RotationStrategy" # "DoubleMAStrategy" "AgentStrategy" "BenchmarkStrategy" "RotationStrategy"
 
-# LLM 多配置（Agent 策略）：通过 llm.active 切换，API Key 从 .env 中对应 env_key 读取
-# 真实模型/端点名请在 .env 中配置（ARK_MODEL、NVIDIA_MODEL 等），会覆盖此处占位符，勿提交到 git
+# LLM：仅保留结构，所有密钥/模型均从 .env 读取，改 .env 即全局生效
+# .env 主模型支持逗号分隔多模型，首 token 超时(默认 60s)则退阶下一模型；可选 LLM_FIRST_TOKEN_TIMEOUT_SECONDS
+# 可选: NVIDIA_MODEL_ANALYST / _RISK / _FUND、ARK_MODEL_ANALYST / _RISK / _FUND（不设则用主模型）
 llm:
-  active: volcano  # 可选: nvidia | volcano (nvidia 端点当前 DEGRADED, 回退 volcano)
   providers:
     nvidia:
       base_url: "https://integrate.api.nvidia.com/v1"
-      # 可在 .env 中设置 NVIDIA_MODEL 覆盖
-      model: "YOUR_NVIDIA_MODEL"
       env_key: NVIDIA_API_KEY
-      agent_models:
-        market_analyst: "YOUR_NVIDIA_MODEL_ANALYST"
-        risk_manager: "YOUR_NVIDIA_MODEL_RISK"
-        fund_manager: "YOUR_NVIDIA_MODEL_FUND"
     volcano:
       base_url: "https://ark.cn-beijing.volces.com/api/v3"
-      # 可在 .env 中设置 ARK_MODEL 覆盖
-      model: "YOUR_ARK_ENDPOINT_ID"
       env_key: ARK_API_KEY
-      agent_models:
-        market_analyst: "YOUR_ARK_ENDPOINT_ID"
-        risk_manager: "YOUR_ARK_ENDPOINT_ID"
-        fund_manager: "YOUR_ARK_ENDPOINT_ID"
 
 # ── 邮件报告 ──
 # SMTP 密码建议放 .env (SMTP_PASSWORD), 此处仅存结构性配置
