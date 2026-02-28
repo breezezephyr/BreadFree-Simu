@@ -93,3 +93,22 @@ daily_report:
   top_n: 5                 # 报告展示 Top-N 标的
   lookback_period: 20      # 效率分回看窗口
   backtest_days: 120       # 收益曲线回看天数
+
+# ── 主动选股配置 ──
+discovery:
+  enabled: true
+  min_amount: 50000000     # 最低日成交额 (元), 5000万
+  min_circ_mv: 5000000000  # 最低流通市值 (元), 50亿
+  min_turnover: 0.3        # 最低换手率 (%)
+  max_discover: 30         # 最多发现标的数
+  efficiency_threshold: 0.5 # 效率分阈值
+  cache_hours: 12          # 扫描缓存时长 (小时)
+  scan_etf: true           # 扫描 ETF
+  scan_stock: true         # 扫描个股
+
+# ── 动态触发配置 ──
+dynamic_signal:
+  min_hold_days: 10        # 最小持仓天数 (低频保护)
+  max_hold_days: 40        # 最大持仓天数 (强制调仓)
+  trailing_stop_pct: -0.08 # 移动止损 (从峰值回撤 8%)
+  rebalance_score_threshold: 0.6  # 调仓综合评分阈值
