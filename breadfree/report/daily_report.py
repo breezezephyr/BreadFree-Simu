@@ -34,6 +34,8 @@ from breadfree.engine.backtest_engine import BacktestEngine
 from breadfree.strategies.effi_rotation_strategy import RotationStrategy
 from breadfree.strategies.agent_strategy_v2 import AgentStrategyV2
 from breadfree.strategies.effi_agent_strategy import EffiAgentRotationStrategy
+from breadfree.strategies.dynamic_rotation_strategy import DynamicRotationStrategy
+from breadfree.data.stock_discovery import StockDiscovery
 
 logger = get_logger(__name__)
 
@@ -47,6 +49,16 @@ STRATEGY_META = {
         "desc": "纯量化多因子策略。基于效率分 = (动量/波动率)×R² 进行标的排名，"
                 "结合动量加速度和回撤惩罚进行多因子合成，等权配置 Top-N 标的，"
                 "每 hold_period 天调仓一次。无需 LLM，执行速度最快。",
+        "needs_llm": False,
+    },
+    "DynamicRotation": {
+        "cls": DynamicRotationStrategy,
+        "label": "DynamicRotation (主动发现+动态触发)",
+        "color": "#d48806",
+        "desc": "在 RotationStrategy 基础上三大升级: ①主动选股——不局限于固定池，"
+                "全市场扫描发现高效率标的; ②动态触发——信号引擎替代固定周期，"
+                "在最优买卖点进出场; ③自适应持仓——强趋势延持，弱趋势缩持，"
+                "止损果断执行。保持低频交易原则。",
         "needs_llm": False,
     },
     "AgentStrategyV2": {
@@ -136,6 +148,26 @@ def calc_top_n_scores(top_n: int = 5, lookback: int = 20) -> list:
         item["rank"] = i
 
     return scored[:top_n]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 全市场主动发现
+# ═══════════════════════════════════════════════════════════════
+
+def _run_discovery_scan() -> dict:
+    """执行全市场扫描, 返回发现摘要"""
+    try:
+        discovery = StockDiscovery(
+            min_amount=5e7,
+            min_circ_mv=5e9,
+            efficiency_threshold=0.5,
+            lookback_period=20,
+            max_discover=15,
+        )
+        return discovery.get_discovery_summary()
+    except Exception as e:
+        logger.warning(f"[Report] 主动发现扫描异常: {e}")
+        return {"total_discovered": 0, "top_discoveries": []}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -236,7 +268,7 @@ def _run_backtest(strategy_name: str, backtest_days: int,
     top_losses = sorted([c for c in closed if c["return_pct"] < 0],
                         key=lambda c: c["pnl"])[:3]
 
-    return {
+    result = {
         "strategy_name": strategy_name,
         "label": meta["label"],
         "color": meta["color"],
@@ -258,6 +290,15 @@ def _run_backtest(strategy_name: str, backtest_days: int,
         "cash": engine.broker.cash,
         "cash_pct": engine.broker.cash / final_equity if final_equity > 0 else 1.0,
     }
+
+    if hasattr(engine.strategy, "get_performance_summary"):
+        perf = engine.strategy.get_performance_summary()
+        if "signal_stats" in perf:
+            result["signal_stats"] = perf["signal_stats"]
+        if "discovery_count" in perf:
+            result["discovery_count"] = perf.get("discovery_count", 0)
+
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -512,7 +553,99 @@ def _build_strategy_section(result: dict, cid: str, section_num: int) -> str:
     </div>"""
 
 
-def _build_html_report(top_scores: list, results: List[dict], report_date: str) -> str:
+def _build_discovery_section(discovery_summary: dict) -> str:
+    """构建全市场主动发现模块的 HTML"""
+    discoveries = discovery_summary.get("top_discoveries", [])
+    if not discoveries:
+        return """
+        <div style="margin-top:16px; padding:12px; background:#f9f9f9; border-radius:6px;">
+            <h3 style="margin:0 0 8px 0;">🔍 全市场主动发现</h3>
+            <p style="font-size:13px; color:#888;">本次扫描未发现符合条件的新标的 (或网络不可用)</p>
+        </div>"""
+
+    rows = ""
+    for i, d in enumerate(discoveries[:10], 1):
+        eff = d.get("efficiency", 0)
+        mom = d.get("momentum", 0)
+        signal = _signal_html(eff)
+        asset_tag = "ETF" if d.get("asset_type") == "etf" else "股票"
+        rows += f"""
+        <tr>
+            <td style="text-align:center">{i}</td>
+            <td>{d.get('symbol', '')}</td>
+            <td>{d.get('name', '')} <span style="font-size:10px;color:#999;">[{asset_tag}]</span></td>
+            <td style="text-align:right">{d.get('latest_price', 0):.2f}</td>
+            <td style="text-align:right">{mom * 100:+.2f}%</td>
+            <td style="text-align:right">{d.get('volatility', 0) * 100:.2f}%</td>
+            <td style="text-align:right;font-weight:bold">{eff:.2f}</td>
+            <td style="text-align:center">{signal}</td>
+        </tr>"""
+
+    avg_eff = discovery_summary.get("avg_efficiency", 0)
+    max_eff = discovery_summary.get("max_efficiency", 0)
+
+    return f"""
+    <div style="margin-top:16px; padding:12px; background:#fffbe6; border:1px solid #ffe58f; border-radius:6px;">
+        <h3 style="margin:0 0 8px 0;">🔍 全市场主动发现 <span style="font-size:12px;color:#888;font-weight:normal;">
+            发现 {len(discoveries)} 个高效率标的 | 平均效率分 {avg_eff:.2f} | 最高 {max_eff:.2f}</span></h3>
+        <p style="font-size:12px; color:#666; margin:0 0 8px 0;">
+            从全 A 股/ETF 市场扫描, 筛选流动性充足 (日成交额&gt;5000万, 流通市值&gt;50亿) 且效率分&gt;0.5 的标的.
+            标有 ★ 的标的为新发现, 不在固定池内.
+        </p>
+        <table style="border-collapse:collapse; width:100%; font-size:12px;" border="1" cellpadding="5">
+        <thead style="background:#f5f5f5;">
+        <tr><th>排名</th><th>代码</th><th>名称</th><th>最新价</th>
+            <th>动量</th><th>波动率</th><th>效率分</th><th>信号</th></tr>
+        </thead><tbody>{rows}</tbody></table>
+    </div>"""
+
+
+def _build_signal_section(results: List[dict]) -> str:
+    """构建动态交易信号模块的 HTML (从 DynamicRotation 结果提取)"""
+    dyn_result = None
+    for r in results:
+        if r.get("strategy_name") == "DynamicRotation":
+            dyn_result = r
+            break
+
+    if not dyn_result:
+        return ""
+
+    signal_stats = dyn_result.get("signal_stats", {})
+    if not signal_stats or signal_stats.get("total_signals", 0) == 0:
+        return ""
+
+    type_counts = signal_stats.get("signal_types", {})
+    type_rows = ""
+    type_labels = {
+        "rebalance": "定期调仓",
+        "trailing_stop": "移动止损",
+        "efficiency_degradation": "效率衰减",
+        "momentum_breakout": "动量突破",
+        "volume_surge": "成交量异动",
+    }
+    for t, count in type_counts.items():
+        label = type_labels.get(t, t)
+        type_rows += f"<span style='margin-right:12px;'>{label}: <b>{count}</b>次</span>"
+
+    return f"""
+    <div style="margin-top:16px; padding:12px; background:#f0f5ff; border:1px solid #adc6ff; border-radius:6px;">
+        <h3 style="margin:0 0 8px 0;">⚡ 动态交易信号统计</h3>
+        <p style="font-size:13px; margin:4px 0;">
+            总触发 <b>{signal_stats['total_signals']}</b> 次 |
+            平均信号强度 <b>{signal_stats.get('avg_score', 0):.2f}</b>
+        </p>
+        <div style="font-size:12px; color:#555; margin-top:4px;">
+            {type_rows}
+        </div>
+        <p style="font-size:11px; color:#999; margin:8px 0 0 0;">
+            信号引擎替代固定周期调仓, 在移动止损/效率衰减/动量突破等多维信号融合下动态决策入场和离场时机.
+        </p>
+    </div>"""
+
+
+def _build_html_report(top_scores: list, results: List[dict], report_date: str,
+                       discovery_summary: dict = None) -> str:
     ranking_table = _build_ranking_table(top_scores) if top_scores else "<p>暂无数据</p>"
     top_n = len(top_scores) if top_scores else 0
 
@@ -530,6 +663,14 @@ def _build_html_report(top_scores: list, results: List[dict], report_date: str) 
             f'收益 {best["metrics"]["total_return"]:.2%}，'
             f'Sharpe {best["metrics"]["sharpe_ratio"]:.2f}</p>')
 
+    discovery_html = ""
+    if discovery_summary:
+        discovery_html = _build_discovery_section(discovery_summary)
+
+    signal_html = _build_signal_section(results)
+
+    strategy_names = " / ".join(r["strategy_name"] for r in results)
+
     html = f"""\
 <!DOCTYPE html>
 <html>
@@ -539,13 +680,17 @@ def _build_html_report(top_scores: list, results: List[dict], report_date: str) 
 <h2 style="border-bottom:2px solid #c23531; padding-bottom:8px;">
     BreadFree 每日多策略决策报告
 </h2>
-<p style="color:#888; font-size:13px;">报告日期: {report_date} | 策略池: RotationStrategy / AgentStrategyV2 / EffiA</p>
+<p style="color:#888; font-size:13px;">报告日期: {report_date} | 策略池: {strategy_names}</p>
 
 <h3>Top {top_n} 标的因子排名 (全池量化评分)</h3>
 {ranking_table}
 <p style="font-size:12px; color:#999; margin-top:4px;">
 效率分 = (动量 / 区间波动率) &times; R&sup2;&ensp;|&ensp;动量 = 20日ROC&ensp;|&ensp;R&sup2; 衡量趋势线性度
 </p>
+
+{discovery_html}
+
+{signal_html}
 
 {'<h3>多策略收益对比</h3>' if len(results) > 1 else ''}
 {'<img src="cid:chart_comparison" style="width:100%; max-width:700px; border:1px solid #eee;" />' if len(results) > 1 else ''}
@@ -587,8 +732,12 @@ def generate_and_send_report():
         return False
     logger.info(f"[Report] Top-{top_n}: {[f'{s['symbol']}-{s['name']}' for s in top_scores]}")
 
-    # 2) 运行 3 种策略回测
-    strategy_order = ["RotationStrategy", "AgentStrategyV2", "EffiA"]
+    # 2) 全市场主动发现扫描
+    logger.info("[Report] 执行全市场主动发现扫描...")
+    discovery_summary = _run_discovery_scan()
+
+    # 3) 运行多种策略回测 (含新增 DynamicRotation)
+    strategy_order = ["RotationStrategy", "DynamicRotation", "AgentStrategyV2", "EffiA"]
     results = []
     for name in strategy_order:
         r = _run_backtest(name, backtest_days, top_n=top_n, lookback=lookback)
@@ -599,7 +748,7 @@ def generate_and_send_report():
         logger.warning("[Report] 所有策略回测失败, 跳过发送")
         return False
 
-    # 3) 生成图表
+    # 4) 生成图表
     images: Dict[str, bytes] = {}
     if len(results) > 1:
         logger.info("[Report] 生成多策略对比图...")
@@ -610,8 +759,9 @@ def generate_and_send_report():
         logger.info(f"[Report] 生成 {r['strategy_name']} 收益曲线...")
         images[cid] = _generate_single_chart(r)
 
-    # 4) 组装 HTML
-    html = _build_html_report(top_scores, results, report_date)
+    # 5) 组装 HTML
+    html = _build_html_report(top_scores, results, report_date,
+                              discovery_summary=discovery_summary)
 
     subject = (f"BreadFree 多策略报告 {date_short} | "
                + ", ".join(r["strategy_name"] for r in results))

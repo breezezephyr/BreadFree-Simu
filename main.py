@@ -26,6 +26,7 @@ from breadfree.strategies.effi_rotation_strategy import RotationStrategy
 from breadfree.strategies.effi_agent_strategy import EffiAgentRotationStrategy
 from breadfree.strategies.triple_momentum_strategy import TripleMomentumStrategy
 from breadfree.strategies.agent_strategy_v2 import AgentStrategyV2
+from breadfree.strategies.dynamic_rotation_strategy import DynamicRotationStrategy
 
 STRATEGY_MAP = {
     "DoubleMAStrategy": DoubleMAStrategy,
@@ -34,6 +35,7 @@ STRATEGY_MAP = {
     "RotationStrategy": RotationStrategy,
     "EffiA": EffiAgentRotationStrategy,
     "TripleMomentumStrategy": TripleMomentumStrategy,
+    "DynamicRotation": DynamicRotationStrategy,
 }
 
 
@@ -60,6 +62,14 @@ def main():
     parser.add_argument("--momentum_day", type=int, help="动量回归窗口")
     parser.add_argument("--slope_n", type=int, help="斜率/效率窗口")
     parser.add_argument("--rebalance_threshold", type=float, help="调仓阈值倍数")
+
+    # DynamicRotation 专用参数
+    parser.add_argument("--min_hold_days", type=int, help="最小持仓天数")
+    parser.add_argument("--max_hold_days", type=int, help="最大持仓天数")
+    parser.add_argument("--trailing_stop_pct", type=float, help="移动止损比例")
+    parser.add_argument("--enable_discovery", action="store_true", default=None,
+                        help="启用主动选股")
+    parser.add_argument("--no_discovery", action="store_true", help="禁用主动选股")
 
     parser.add_argument("--output_file", type=str, default="", help="输出文件名")
     args = parser.parse_args()
@@ -110,6 +120,18 @@ def main():
             strategy_params["use_efficiency"] = bool(args.use_efficiency)
         elif "use_efficiency" in config:
             strategy_params["use_efficiency"] = config["use_efficiency"]
+
+        # DynamicRotation 专用参数
+        if strategy_name == "DynamicRotation":
+            dyn_keys = ["min_hold_days", "max_hold_days", "trailing_stop_pct"]
+            for key in dyn_keys:
+                val = getattr(args, key, None)
+                if val is not None:
+                    strategy_params[key] = val
+            if args.no_discovery:
+                strategy_params["enable_discovery"] = False
+            elif args.enable_discovery:
+                strategy_params["enable_discovery"] = True
 
     if strategy_params:
         print("Hyperparameters:")
