@@ -337,6 +337,9 @@ class DynamicRotationStrategy(BreadFreeStrategy):
         current_prices = {s: bars[s]["close"] for s in bars if s in self.history}
         equity = self.broker.get_total_equity(current_prices)
         self.peak_equity = max(self.peak_equity, equity)
+        current_holdings = set(self.broker.positions.keys())
+
+        self.signal_engine.update_peaks(current_holdings, current_prices, equity)
 
         # 组合回撤熔断
         if self.peak_equity > 0:
@@ -430,6 +433,12 @@ class DynamicRotationStrategy(BreadFreeStrategy):
             weights = self._calc_weights(target_symbols, factor_data)
             logger.info(f"目标权重: { {s: f'{w:.2%}' for s, w in weights.items()} }")
             self._execute_rebalance(date, bars, target_symbols, weights)
+
+            # 调仓后重置持仓峰值为当前价, 避免同一回撤反复触发止损
+            if signal.signal_type == SignalType.TRAILING_STOP:
+                for sym in target_symbols:
+                    if sym in current_prices:
+                        self.signal_engine._holding_peaks[sym] = current_prices[sym]
         else:
             logger.info("无有效标的, 持有现金")
 

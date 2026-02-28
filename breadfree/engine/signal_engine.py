@@ -111,11 +111,12 @@ class SignalEngine:
     # ──────────────────────────────────────────────────────────
 
     def _check_trailing_stop(
-        self, holdings: Dict[str, float], current_prices: Dict[str, float]
+        self, holdings: set, current_prices: Dict[str, float]
     ) -> SignalResult:
-        """移动止损: 任一持仓从峰值回撤超过阈值"""
+        """移动止损: 任一持仓从峰值回撤超过阈值 (只检查实际持仓)"""
         triggered_symbols = []
-        for symbol, peak in self._holding_peaks.items():
+        for symbol in holdings:
+            peak = self._holding_peaks.get(symbol, 0)
             if symbol not in current_prices or peak <= 0:
                 continue
             current = current_prices[symbol]
@@ -220,12 +221,14 @@ class SignalEngine:
     # 综合评估
     # ──────────────────────────────────────────────────────────
 
-    def update_peaks(self, current_prices: Dict[str, float], equity: float):
-        """更新持仓峰值 (每日调用)"""
+    def update_peaks(self, holdings: set, current_prices: Dict[str, float],
+                     equity: float):
+        """更新持仓峰值 (每日调用, 只跟踪实际持仓)"""
         self._peak_equity = max(self._peak_equity, equity)
-        for symbol, price in current_prices.items():
-            prev_peak = self._holding_peaks.get(symbol, 0)
-            self._holding_peaks[symbol] = max(prev_peak, price)
+        for symbol in holdings:
+            if symbol in current_prices:
+                prev_peak = self._holding_peaks.get(symbol, 0)
+                self._holding_peaks[symbol] = max(prev_peak, current_prices[symbol])
 
     def clear_holding_peak(self, symbol: str):
         """清仓时移除持仓峰值跟踪"""
@@ -257,7 +260,7 @@ class SignalEngine:
         Returns:
             SignalResult (trigger=True 表示应该调仓)
         """
-        self.update_peaks(current_prices, equity)
+        self.update_peaks(holdings, current_prices, equity)
 
         if days_held >= self.max_hold_days:
             result = SignalResult(
@@ -268,9 +271,7 @@ class SignalEngine:
             return result
 
         if days_held < self.min_hold_days:
-            ts_signal = self._check_trailing_stop(
-                {s: current_prices.get(s, 0) for s in holdings},
-                current_prices)
+            ts_signal = self._check_trailing_stop(holdings, current_prices)
             if ts_signal.trigger:
                 self._record_signal(days_held, ts_signal)
                 return ts_signal
@@ -282,9 +283,7 @@ class SignalEngine:
 
         signals = []
 
-        ts = self._check_trailing_stop(
-            {s: current_prices.get(s, 0) for s in holdings},
-            current_prices)
+        ts = self._check_trailing_stop(holdings, current_prices)
         signals.append(ts)
 
         ed = self._check_efficiency_degradation(current_efficiency, holdings)

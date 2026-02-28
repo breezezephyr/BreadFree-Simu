@@ -22,7 +22,7 @@ uv run python main.py --strategy AgentStrategyV2 --lookback_period 20 --hold_per
 uv run python main.py --strategy EffiA --lookback_period 20 --hold_period 20
 ```
 
-Available strategies: `RotationStrategy`, `BenchmarkStrategy`, `DoubleMAStrategy`, `TripleMomentumStrategy`, `AgentStrategyV2`, `EffiA`.
+Available strategies: `RotationStrategy`, `BenchmarkStrategy`, `DoubleMAStrategy`, `TripleMomentumStrategy`, `AgentStrategyV2`, `EffiA`, `DynamicRotation`.
 
 ### Required secrets for LLM strategies
 
@@ -37,10 +37,18 @@ Without these, `AgentStrategyV2` and `EffiA` will fail with 404. Pure quant stra
 ### Strategy architecture (V2)
 
 ```
-RotationStrategy (纯量化):  多因子效率分 → Top-N 选股 → 等权/风险平价加权
-AgentStrategyV2  (LLM辩证): QuantEngine → Bull Analyst → Bear Challenger → PM 裁决
-EffiA            (LLM轮动): QuantPrep → Analyst Agent → RiskMgr Agent
+RotationStrategy  (纯量化):    多因子效率分 → Top-N 选股 → 等权/风险平价加权
+DynamicRotation   (主动+动态): 全市场扫描 → SignalEngine 动态触发 → 移动止损/动量突破
+AgentStrategyV2   (LLM辩证):  QuantEngine → Bull Analyst → Bear Challenger → PM 裁决
+EffiA             (LLM轮动):  QuantPrep → Analyst Agent → RiskMgr Agent
 ```
+
+`DynamicRotation` 在 `RotationStrategy` 基础上增加三大能力:
+- **主动选股** (`breadfree/data/stock_discovery.py`): 全市场 A 股/ETF 扫描, 流动性过滤 + 效率分排名
+- **动态触发** (`breadfree/engine/signal_engine.py`): 移动止损/效率衰减/动量突破/成交量异动多维信号融合
+- **自适应持仓**: min_hold_days(10) ~ max_hold_days(40), 强趋势延持, 弱趋势缩持
+- 配置: `breadfree/config.yaml` 下 `discovery` 和 `dynamic_signal` 段
+- **注意**: 主动发现全市场扫描首次运行需要联网获取大量历史数据 (178+ 标的), 耗时较长; 使用 `--no_discovery` 可禁用
 
 `RotationStrategy` 是核心量化策略, 多因子合成:
 - `efficiency = (momentum / period_vol) * R²` — 风险调整后的趋势质量
