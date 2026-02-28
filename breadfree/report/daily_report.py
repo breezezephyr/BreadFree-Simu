@@ -1,10 +1,12 @@
 """
-每日策略决策报告生成器
+每日多策略决策报告生成器
 
 功能:
-    1. 计算全池 25 标的的最新多因子效率分, 输出 Top-N 决策表
-    2. 运行 RotationStrategy 回测生成收益曲线 PNG
-    3. 组装 HTML 报告, 通过 email_reporter 发送
+    1. 计算全池 25 标的最新多因子效率分, 输出 Top-N 决策表
+    2. 运行 3 种策略回测 (RotationStrategy / AgentStrategyV2 / EffiA)
+    3. 每种策略: 排名表 + 文本总结 + 收益曲线
+    4. 生成对比收益曲线 (3 条线叠加)
+    5. 组装 HTML 邮件, 通过 email_reporter 发送
 """
 
 import io
@@ -12,6 +14,7 @@ import os
 import sys
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -21,28 +24,64 @@ sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), ".."
 from breadfree.utils.config import get_config
 from breadfree.utils.logger import get_logger
 from breadfree.utils.email_reporter import send_report_email
-from breadfree.utils.metrics import calculate_efficiency_metrics
+from breadfree.utils.metrics import (
+    calculate_efficiency_metrics, calculate_total_return,
+    calculate_max_drawdown, calculate_sharpe_ratio, calculate_annualized_return,
+)
 from breadfree.data.data_fetcher import DataFetcher
 from breadfree.data.database import get_db_manager
 from breadfree.engine.backtest_engine import BacktestEngine
 from breadfree.strategies.effi_rotation_strategy import RotationStrategy
+from breadfree.strategies.agent_strategy_v2 import AgentStrategyV2
+from breadfree.strategies.effi_agent_strategy import EffiAgentRotationStrategy
 
 logger = get_logger(__name__)
 
 TZ_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
+STRATEGY_META = {
+    "RotationStrategy": {
+        "cls": RotationStrategy,
+        "label": "RotationStrategy (纯量化效率轮动)",
+        "color": "#c23531",
+        "desc": "纯量化多因子策略。基于效率分 = (动量/波动率)×R² 进行标的排名，"
+                "结合动量加速度和回撤惩罚进行多因子合成，等权配置 Top-N 标的，"
+                "每 hold_period 天调仓一次。无需 LLM，执行速度最快。",
+        "needs_llm": False,
+    },
+    "AgentStrategyV2": {
+        "cls": AgentStrategyV2,
+        "label": "AgentStrategyV2 (LLM 辩证决策)",
+        "color": "#2f4554",
+        "desc": "量化锚定 + LLM 精调。QuantEngine 计算效率分选出 Top-N 候选，"
+                "Analyst LLM 根据多周期动量一致性和市场情报分配权重，"
+                "RiskMgr LLM 风控审核微调。LLM 只能在量化候选池内调仓，"
+                "不可引入新标的，总投资度 85%-95%。",
+        "needs_llm": True,
+    },
+    "EffiA": {
+        "cls": EffiAgentRotationStrategy,
+        "label": "EffiA (LLM 轻量轮动)",
+        "color": "#61a0a8",
+        "desc": "轻量版 LLM 轮动。DataPrep 计算效率分筛选 Top-3 候选，"
+                "Analyst LLM 在候选池内分配权重（至少 2 只，单只≤60%），"
+                "RiskMgr LLM 微调。架构比 V2 更简洁，响应更快，"
+                "适合低延迟场景。",
+        "needs_llm": True,
+    },
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 数据获取
+# ═══════════════════════════════════════════════════════════════
 
 def _get_etf_pool() -> dict:
-    """返回 {symbol: name} 映射"""
     cfg = get_config()
     return dict(cfg.get("etf_pool", {"510300": "沪深300ETF"}))
 
 
 def _fetch_latest_prices(symbols: list, lookback_days: int = 60) -> dict:
-    """
-    获取每只标的最近 N 天的收盘价序列.
-    Returns: {symbol: [float, ...]}
-    """
     now = datetime.now(TZ_SHANGHAI)
     end_date = now.strftime("%Y%m%d")
     start_date = (now - timedelta(days=lookback_days + 30)).strftime("%Y%m%d")
@@ -76,14 +115,6 @@ def _fetch_latest_prices(symbols: list, lookback_days: int = 60) -> dict:
 
 
 def calc_top_n_scores(top_n: int = 5, lookback: int = 20) -> list:
-    """
-    计算全池标的的因子得分, 返回 Top-N 列表.
-
-    Returns:
-        [{'rank': 1, 'symbol': '300124', 'name': '汇川技术',
-          'momentum': 0.17, 'volatility': 0.012, 'r2': 0.91,
-          'efficiency': 3.07, 'close': 69.0}, ...]
-    """
     pool = _get_etf_pool()
     symbols = list(pool.keys())
     price_map = _fetch_latest_prices(symbols, lookback_days=lookback * 3)
@@ -107,12 +138,21 @@ def calc_top_n_scores(top_n: int = 5, lookback: int = 20) -> list:
     return scored[:top_n]
 
 
-def _generate_equity_curve_png(backtest_days: int = 120) -> bytes:
-    """运行 RotationStrategy 回测, 返回权益曲线 PNG bytes."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
+# ═══════════════════════════════════════════════════════════════
+# 回测运行 & 性能摘要
+# ═══════════════════════════════════════════════════════════════
+
+def _run_backtest(strategy_name: str, backtest_days: int,
+                  top_n: int = 5, lookback: int = 20) -> Optional[dict]:
+    """运行单个策略回测, 返回 {equity_curve, metrics, strategy_name}"""
+    meta = STRATEGY_META.get(strategy_name)
+    if not meta:
+        return None
+
+    has_llm_keys = bool(os.getenv("ARK_API_KEY") or os.getenv("NVIDIA_API_KEY"))
+    if meta["needs_llm"] and not has_llm_keys:
+        logger.warning(f"[Report] {strategy_name} 需要 LLM API Key, 跳过")
+        return None
 
     now = datetime.now(TZ_SHANGHAI)
     end_date = now.strftime("%Y%m%d")
@@ -122,43 +162,82 @@ def _generate_equity_curve_png(backtest_days: int = 120) -> bytes:
     symbols = list(cfg.get("etf_pool", {"510300": "沪深300ETF"}).keys())
     initial_cash = cfg.get("initial_cash", 100000.0)
 
-    engine = BacktestEngine(
-        strategy_cls=RotationStrategy,
-        symbols=symbols,
-        start_date=start_date,
-        end_date=end_date,
-        initial_cash=initial_cash,
-        lookback_period=cfg.get("daily_report", {}).get("lookback_period", 20),
-        hold_period=20,
-        top_n=cfg.get("daily_report", {}).get("top_n", 5),
-    )
-    engine.run()
+    kwargs = {"lookback_period": lookback, "hold_period": 20, "top_n": top_n}
+
+    get_db_manager().clear_cache()
+
+    logger.info(f"[Report] 运行 {strategy_name} 回测 ({start_date}~{end_date})...")
+    try:
+        engine = BacktestEngine(
+            strategy_cls=meta["cls"],
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+            initial_cash=initial_cash,
+            **kwargs,
+        )
+        engine.run()
+    except Exception as e:
+        logger.error(f"[Report] {strategy_name} 回测异常: {e}")
+        return None
 
     if not engine.broker.equity_curve:
-        logger.warning("[Report] 回测无权益数据, 生成空图")
-        fig, ax = plt.subplots(figsize=(10, 4))
-        ax.text(0.5, 0.5, "暂无数据", ha="center", va="center", fontsize=16)
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
-        plt.close(fig)
-        return buf.getvalue()
+        logger.warning(f"[Report] {strategy_name} 无权益数据")
+        return None
 
+    eq = pd.Series([d["equity"] for d in engine.broker.equity_curve])
     dates = [d["date"] for d in engine.broker.equity_curve]
     equities = [d["equity"] for d in engine.broker.equity_curve]
-    total_ret = (equities[-1] / initial_cash - 1) * 100
+    trade_returns = [t["return_pct"] for t in engine.broker.closed_trades]
+
+    total_ret = calculate_total_return(eq, initial_capital=initial_cash)
+    annual_ret = calculate_annualized_return(eq, annual_days=242)
+    max_dd = calculate_max_drawdown(eq)
+    sharpe = calculate_sharpe_ratio(eq)
+
+    return {
+        "strategy_name": strategy_name,
+        "label": meta["label"],
+        "color": meta["color"],
+        "desc": meta["desc"],
+        "dates": dates,
+        "equities": equities,
+        "initial_cash": initial_cash,
+        "metrics": {
+            "total_return": total_ret,
+            "annualized_return": annual_ret,
+            "max_drawdown": max_dd,
+            "sharpe_ratio": sharpe,
+            "total_trades": len(trade_returns),
+        },
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# 图表生成
+# ═══════════════════════════════════════════════════════════════
+
+def _generate_comparison_chart(results: List[dict]) -> bytes:
+    """生成多策略对比收益曲线 PNG"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
 
     plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
     plt.rcParams["axes.unicode_minus"] = False
 
-    fig, ax = plt.subplots(figsize=(10, 4.5))
-    ax.plot(dates, equities, color="#c23531", linewidth=1.8, label="Strategy Equity")
-    ax.fill_between(dates, initial_cash, equities, alpha=0.08, color="#c23531")
-    ax.axhline(y=initial_cash, color="#999", linestyle="--", linewidth=0.8)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    initial_cash = results[0]["initial_cash"] if results else 100000
 
-    ax.set_title(f"RotationStrategy ({start_date}~{end_date})  Return: {total_ret:+.2f}%",
-                 fontsize=13, fontweight="bold")
+    for r in results:
+        ax.plot(r["dates"], r["equities"], color=r["color"],
+                linewidth=1.8, label=r["strategy_name"])
+
+    ax.axhline(y=initial_cash, color="#999", linestyle="--", linewidth=0.8, label="Baseline")
+    ax.set_title("Multi-Strategy Comparison", fontsize=14, fontweight="bold")
     ax.set_ylabel("Equity (CNY)")
-    ax.legend(loc="upper left")
+    ax.legend(loc="upper left", fontsize=9)
     ax.grid(True, alpha=0.3)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
     fig.autofmt_xdate(rotation=30)
@@ -170,73 +249,144 @@ def _generate_equity_curve_png(backtest_days: int = 120) -> bytes:
     return buf.getvalue()
 
 
-def _build_html_report(top_scores: list, report_date: str) -> str:
-    """组装 HTML 邮件正文"""
+def _generate_single_chart(result: dict) -> bytes:
+    """生成单策略收益曲线 PNG"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
 
-    rows_html = ""
-    for item in top_scores:
-        mom_pct = f"{item['momentum'] * 100:+.2f}%"
-        vol_pct = f"{item['volatility'] * 100:.2f}%"
-        r2_val = f"{item['r2']:.2f}"
-        eff_val = f"{item['efficiency']:.2f}"
-        close_val = f"{item['close']:.3f}"
+    plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False
 
-        if item["efficiency"] >= 2.0:
-            signal = '<span style="color:#c23531;font-weight:bold">&#9650; 强势</span>'
-        elif item["efficiency"] >= 1.0:
-            signal = '<span style="color:#d48806;font-weight:bold">&#9650; 看多</span>'
-        elif item["efficiency"] >= 0:
-            signal = '<span style="color:#666">&#9644; 中性</span>'
-        else:
-            signal = '<span style="color:#389e0d">&#9660; 看空</span>'
+    fig, ax = plt.subplots(figsize=(10, 4))
+    initial = result["initial_cash"]
+    ret = result["metrics"]["total_return"] * 100
 
-        rows_html += f"""
+    ax.plot(result["dates"], result["equities"], color=result["color"],
+            linewidth=1.8, label="Equity")
+    ax.fill_between(result["dates"], initial, result["equities"],
+                    alpha=0.08, color=result["color"])
+    ax.axhline(y=initial, color="#999", linestyle="--", linewidth=0.8)
+
+    ax.set_title(f"{result['strategy_name']}  Return: {ret:+.2f}%",
+                 fontsize=12, fontweight="bold")
+    ax.set_ylabel("Equity (CNY)")
+    ax.legend(loc="upper left", fontsize=9)
+    ax.grid(True, alpha=0.3)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
+    fig.autofmt_xdate(rotation=30)
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+# ═══════════════════════════════════════════════════════════════
+# HTML 报告
+# ═══════════════════════════════════════════════════════════════
+
+def _signal_html(eff: float) -> str:
+    if eff >= 2.0:
+        return '<span style="color:#c23531;font-weight:bold">&#9650; 强势</span>'
+    elif eff >= 1.0:
+        return '<span style="color:#d48806;font-weight:bold">&#9650; 看多</span>'
+    elif eff >= 0:
+        return '<span style="color:#666">&#9644; 中性</span>'
+    else:
+        return '<span style="color:#389e0d">&#9660; 看空</span>'
+
+
+def _build_ranking_table(scores: list) -> str:
+    rows = ""
+    for item in scores:
+        rows += f"""
         <tr>
             <td style="text-align:center">{item['rank']}</td>
             <td>{item['symbol']}</td>
             <td>{item['name']}</td>
-            <td style="text-align:right">{close_val}</td>
-            <td style="text-align:right">{mom_pct}</td>
-            <td style="text-align:right">{vol_pct}</td>
-            <td style="text-align:right">{r2_val}</td>
-            <td style="text-align:right;font-weight:bold">{eff_val}</td>
-            <td style="text-align:center">{signal}</td>
+            <td style="text-align:right">{item['close']:.3f}</td>
+            <td style="text-align:right">{item['momentum'] * 100:+.2f}%</td>
+            <td style="text-align:right">{item['volatility'] * 100:.2f}%</td>
+            <td style="text-align:right">{item['r2']:.2f}</td>
+            <td style="text-align:right;font-weight:bold">{item['efficiency']:.2f}</td>
+            <td style="text-align:center">{_signal_html(item['efficiency'])}</td>
         </tr>"""
+    return f"""
+    <table style="border-collapse:collapse; width:100%; font-size:13px;" border="1" cellpadding="6">
+    <thead style="background:#f5f5f5;">
+    <tr><th>排名</th><th>代码</th><th>名称</th><th>最新价</th>
+        <th>动量</th><th>波动率</th><th>R&sup2;</th><th>效率分</th><th>信号</th></tr>
+    </thead><tbody>{rows}</tbody></table>"""
+
+
+def _build_metrics_bar(m: dict) -> str:
+    return (
+        f'<div style="display:flex;gap:16px;flex-wrap:wrap;margin:8px 0;font-size:13px;">'
+        f'<span>收益 <b>{m["total_return"]:.2%}</b></span>'
+        f'<span>年化 <b>{m["annualized_return"]:.2%}</b></span>'
+        f'<span>Sharpe <b>{m["sharpe_ratio"]:.2f}</b></span>'
+        f'<span>最大回撤 <b>{m["max_drawdown"]:.2%}</b></span>'
+        f'<span>交易 <b>{m["total_trades"]}</b>次</span>'
+        f'</div>')
+
+
+def _build_strategy_section(result: dict, cid: str, section_num: int) -> str:
+    m = result["metrics"]
+    color = result["color"]
+    return f"""
+    <div style="margin-top:24px; border-left:4px solid {color}; padding-left:12px;">
+        <h3 style="margin-bottom:4px;">策略 {section_num}: {result['label']}</h3>
+        <p style="color:#666; font-size:13px; margin:4px 0 8px 0;">{result['desc']}</p>
+        {_build_metrics_bar(m)}
+        <img src="cid:{cid}" style="width:100%; max-width:680px; border:1px solid #eee; margin-top:8px;" />
+    </div>"""
+
+
+def _build_html_report(top_scores: list, results: List[dict], report_date: str) -> str:
+    ranking_table = _build_ranking_table(top_scores) if top_scores else "<p>暂无数据</p>"
+    top_n = len(top_scores) if top_scores else 0
+
+    strategy_sections = ""
+    for i, r in enumerate(results, 1):
+        cid = f"chart_{r['strategy_name'].lower()}"
+        strategy_sections += _build_strategy_section(r, cid, i)
+
+    best = max(results, key=lambda r: r["metrics"]["total_return"]) if results else None
+    best_note = ""
+    if best and len(results) > 1:
+        best_note = (
+            f'<p style="font-size:13px; color:#333; margin-top:12px;">'
+            f'<b>本期最优:</b> {best["label"]}，'
+            f'收益 {best["metrics"]["total_return"]:.2%}，'
+            f'Sharpe {best["metrics"]["sharpe_ratio"]:.2f}</p>')
 
     html = f"""\
 <!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"></head>
-<body style="font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; color:#333; max-width:720px; margin:auto; padding:16px;">
+<body style="font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; color:#333; max-width:740px; margin:auto; padding:16px;">
 
 <h2 style="border-bottom:2px solid #c23531; padding-bottom:8px;">
-    BreadFree 每日决策报告
+    BreadFree 每日多策略决策报告
 </h2>
-<p style="color:#888; font-size:13px;">报告日期: {report_date} | 策略: RotationStrategy (效率轮动)</p>
+<p style="color:#888; font-size:13px;">报告日期: {report_date} | 策略池: RotationStrategy / AgentStrategyV2 / EffiA</p>
 
-<h3>Top {len(top_scores)} 标的因子排名</h3>
-<table style="border-collapse:collapse; width:100%; font-size:13px;" border="1" cellpadding="6">
-<thead style="background:#f5f5f5;">
-<tr>
-    <th>排名</th><th>代码</th><th>名称</th><th>最新价</th>
-    <th>动量</th><th>波动率</th><th>R&sup2;</th><th>效率分</th><th>信号</th>
-</tr>
-</thead>
-<tbody>
-{rows_html}
-</tbody>
-</table>
-
+<h3>Top {top_n} 标的因子排名 (全池量化评分)</h3>
+{ranking_table}
 <p style="font-size:12px; color:#999; margin-top:4px;">
-效率分 = (动量 / 区间波动率) &times; R&sup2;&ensp;|&ensp;
-动量 = {len(top_scores) and top_scores[0].get('_lookback', 20) or 20}日ROC&ensp;|&ensp;
-R&sup2; 衡量趋势线性度
+效率分 = (动量 / 区间波动率) &times; R&sup2;&ensp;|&ensp;动量 = 20日ROC&ensp;|&ensp;R&sup2; 衡量趋势线性度
 </p>
 
-<h3>投资组合收益曲线</h3>
-<img src="cid:equity_curve" style="width:100%; max-width:700px; border:1px solid #eee;" alt="equity curve" />
+{'<h3>多策略收益对比</h3>' if len(results) > 1 else ''}
+{'<img src="cid:chart_comparison" style="width:100%; max-width:700px; border:1px solid #eee;" />' if len(results) > 1 else ''}
+{best_note}
 
-<hr style="margin-top:24px; border:none; border-top:1px solid #ddd;" />
+{strategy_sections}
+
+<hr style="margin-top:28px; border:none; border-top:1px solid #ddd;" />
 <p style="font-size:11px; color:#aaa;">
 此报告由 BreadFree 自动生成, 仅供研究参考, 不构成投资建议.
 </p>
@@ -245,8 +395,12 @@ R&sup2; 衡量趋势线性度
     return html
 
 
+# ═══════════════════════════════════════════════════════════════
+# 主入口
+# ═══════════════════════════════════════════════════════════════
+
 def generate_and_send_report():
-    """生成并发送每日报告 (主入口)"""
+    """生成并发送每日多策略报告"""
     now = datetime.now(TZ_SHANGHAI)
     report_date = now.strftime("%Y-%m-%d %H:%M")
     date_short = now.strftime("%m/%d")
@@ -256,33 +410,49 @@ def generate_and_send_report():
     lookback = cfg.get("lookback_period", 20)
     backtest_days = cfg.get("backtest_days", 120)
 
-    logger.info(f"[Report] 开始生成每日报告 ({report_date})")
+    logger.info(f"[Report] 开始生成每日多策略报告 ({report_date})")
 
+    # 1) Top-N 因子排名
     logger.info(f"[Report] 计算 Top-{top_n} 因子得分...")
     top_scores = calc_top_n_scores(top_n=top_n, lookback=lookback)
     if not top_scores:
         logger.warning("[Report] 无有效标的得分, 跳过发送")
         return False
-
     logger.info(f"[Report] Top-{top_n}: {[f'{s['symbol']}-{s['name']}' for s in top_scores]}")
 
-    logger.info(f"[Report] 运行 {backtest_days} 天回测生成收益曲线...")
-    get_db_manager().clear_cache()
-    equity_png = _generate_equity_curve_png(backtest_days=backtest_days)
+    # 2) 运行 3 种策略回测
+    strategy_order = ["RotationStrategy", "AgentStrategyV2", "EffiA"]
+    results = []
+    for name in strategy_order:
+        r = _run_backtest(name, backtest_days, top_n=top_n, lookback=lookback)
+        if r:
+            results.append(r)
 
-    html = _build_html_report(top_scores, report_date)
-    subject = f"BreadFree 决策报告 {date_short} | Top-{top_n}: " + ", ".join(
-        f"{s['name']}" for s in top_scores[:3]
-    ) + "..."
+    if not results:
+        logger.warning("[Report] 所有策略回测失败, 跳过发送")
+        return False
 
-    ok = send_report_email(
-        subject=subject,
-        html_body=html,
-        images={"equity_curve": equity_png},
-    )
+    # 3) 生成图表
+    images: Dict[str, bytes] = {}
+    if len(results) > 1:
+        logger.info("[Report] 生成多策略对比图...")
+        images["chart_comparison"] = _generate_comparison_chart(results)
 
+    for r in results:
+        cid = f"chart_{r['strategy_name'].lower()}"
+        logger.info(f"[Report] 生成 {r['strategy_name']} 收益曲线...")
+        images[cid] = _generate_single_chart(r)
+
+    # 4) 组装 HTML
+    html = _build_html_report(top_scores, results, report_date)
+
+    subject = (f"BreadFree 多策略报告 {date_short} | "
+               + ", ".join(r["strategy_name"] for r in results))
+
+    # 5) 发送
+    ok = send_report_email(subject=subject, html_body=html, images=images)
     if ok:
-        logger.info("[Report] 报告发送成功")
+        logger.info("[Report] 多策略报告发送成功")
     else:
         logger.error("[Report] 报告发送失败")
     return ok
