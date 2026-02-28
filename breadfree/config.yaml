@@ -70,3 +70,26 @@ llm:
         market_analyst: "YOUR_ARK_ENDPOINT_ID"
         risk_manager: "YOUR_ARK_ENDPOINT_ID"
         fund_manager: "YOUR_ARK_ENDPOINT_ID"
+
+# ── 邮件报告 ──
+# SMTP 密码建议放 .env (SMTP_PASSWORD), 此处仅存结构性配置
+smtp:
+  host: smtp.qq.com
+  port: 465
+  use_ssl: true
+  user: ""          # 在 .env 中设置 SMTP_USER 覆盖
+  password: ""      # 在 .env 中设置 SMTP_PASSWORD 覆盖
+  # 收件人列表 (支持多个):
+  #   .env 方式: REPORT_RECIPIENTS=a@qq.com,b@163.com,c@gmail.com
+  #   或直接在此配置:
+  report_recipients: []
+  #   - "user1@qq.com"
+  #   - "user2@163.com"
+
+# 定时报告配置
+daily_report:
+  schedule_time: "08:30"   # 东八区每日发送时间
+  timezone: "Asia/Shanghai"
+  top_n: 5                 # 报告展示 Top-N 标的
+  lookback_period: 20      # 效率分回看窗口
+  backtest_days: 120       # 收益曲线回看天数
