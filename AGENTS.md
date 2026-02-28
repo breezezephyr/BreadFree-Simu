@@ -59,3 +59,24 @@ EffiA            (LLM轮动): QuantPrep → Analyst Agent → RiskMgr Agent
 - **SQLite databases are file-based**: `breadfree.db` and `live_trading.db` are auto-created. No external database server needed.
 - **`uv` must be on PATH**: Installed to `~/.local/bin`.
 - **Deleted old strategy variants**: `double_ma_strategy.py`, `effi_agent_strategy_signal.py`, `effi_agent_strategy_hold20d.py` have been consolidated. `ma_strategy.py` is the canonical `DoubleMAStrategy`.
+- **DB singleton preload cache**: `get_db_manager()` is a process-wide singleton. Calling `calc_top_n_scores()` preloads a narrow date window into `_mem_cache`; a subsequent `BacktestEngine.run()` in the same process may get stale data. Call `get_db_manager().clear_cache()` between independent data-loading flows.
+
+### Daily email report
+
+Sends Top-5 factor ranking + equity curve to configured recipients via QQ SMTP.
+
+```bash
+# Scheduled daemon (08:30 Asia/Shanghai daily)
+uv run python daily_report_scheduler.py
+
+# Immediate one-shot (testing)
+uv run python daily_report_scheduler.py --now
+```
+
+| Secret | Purpose |
+|---|---|
+| `SMTP_USER` | QQ 邮箱地址 |
+| `SMTP_PASSWORD` | QQ 邮箱授权码 (非登录密码) |
+| `REPORT_RECIPIENTS` | 收件人, 逗号分隔多个 |
+
+Config in `breadfree/config.yaml` under `daily_report` (schedule_time, top_n, lookback_period, backtest_days).
