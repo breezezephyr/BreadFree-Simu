@@ -107,61 +107,56 @@ def compute_metrics(history: List[float], lookback: int = 20) -> Optional[Dict]:
 # ═══════════════════════════════════════════════════════════════
 
 ANALYST_PROMPT = """\
-你是量化投资策略师。量化引擎已从25只标的中筛选出效率分最高的{top_n}只候选。
+你是进攻型量化策略师。量化引擎已从25只标的中筛选出效率分最高的{top_n}只候选。
 你的任务是在这{top_n}只候选中分配投资权重。
 
-【重要约束】
-- 你只能在下方候选池中分配权重, 不可引入其他标的
-- 总投资比例必须在 85%-95% 之间 (即最多持有15%现金)
-- 单只标的权重范围: 15%-65%
-- 基准配置是等权({base_weight:.0%}每只), 你在此基础上调整
+【核心原则】效率分排名=alpha信号，你应该集中配置最强标的，而非分散到弱标的。
+等权基准({base_weight:.0%}每只)是下限参考，你的工作是把权重向最强标的倾斜。
 
-【候选池及指标 (近{lookback}日)】
+【约束】
+- 只能在下方候选池分配，不可引入新标的
+- 总投资 92%-100%（低现金策略，满仓为王）
+- 单只 20%-65%
+
+【候选池 (近{lookback}日)】
 {metrics_table}
 
-【市场情报】
-{market_intel}
-
+【市场情报】{market_intel}
 【市场政权】{regime}
 【当前持仓】{holdings}
-【上期决策回顾】{last_context}
+【上期回顾】{last_context}
 
-【决策要点】
-- 效率分最高+动量加速度>0+一致性↑↑↑ → 该标的可上调至50-65%
-- 效率分虽高但加速度<0 → 趋势可能衰减, 权重不超过基准
-- 持仓标的仍在候选池中 → 优先保留(降低换手)
-- 全部候选效率分<0.3 → 降低总投资度至85%
+【决策规则——严格按效率分排名执行】
+1. 效率分排名第1 + 加速>0 + 一致性↑↑↑ → 权重 50-65%（重仓最强）
+2. 效率分排名第1 但加速<0 → 权重 35-45%（趋势可能衰减但仍最强）
+3. 其余候选按效率分比例分配剩余权重
+4. 持仓标的仍在候选中 → 保持或加仓（降低换手摩擦）
+5. 不要因为"分散风险"而把最强标的降到等权以下
 
-【输出】纯JSON, 无其他文字:
+【输出】纯JSON:
 {{
-  "weights": {{"{example_sym}": 0.40, ...}},
-  "reasoning": "20字内决策理由"
+  "weights": {{"{example_sym}": 0.50, ...}},
+  "reasoning": "20字内"
 }}"""
 
 RISK_MGR_PROMPT = """\
-你是风控管理官。策略师已在量化引擎筛选的候选池内完成权重分配。
-你需要审核并微调权重。
+你是风控审核官。策略师已完成权重分配，你做最终检查。
 
-【策略师方案】
-{analyst_weights}
+【策略师方案】{analyst_weights}
+【候选池数据】{metrics_table}
+【市场情报】{market_intel}
 
-【候选池数据】
-{metrics_table}
-
-【市场情报】
-{market_intel}
-
-【风控规则】
-1. 波动率>2.5%的标的权重不超过45%
-2. 加速度<-0.02且R²<0.5的标的建议减仓10%
-3. 你只能调整权重, 不可增加新标的
-4. 总投资比例保持 85%-95%
-5. 调整幅度通常在±10%以内
+【审核原则——只在极端风险时干预，否则放行】
+1. 默认放行：策略师方案基于量化效率分，大多数情况直接采纳
+2. 仅当波动率>3.5%且加速<-0.03且R²<0.3时，才建议该标的减5-10%
+3. 不可增加新标的，不可大幅改变排名靠前标的的权重
+4. 总投资保持 92%-100%
+5. 调整幅度不超过±8%，尊重策略师的效率分排名判断
 
 【输出】纯JSON:
 {{
   "final_weights": {{...}},
-  "risk_note": "15字内"
+  "risk_note": "10字内"
 }}"""
 
 
@@ -246,7 +241,7 @@ async def analyst_node(state: V2State) -> dict:
         return {"analyst_output": {}, "llm_calls": state.get("llm_calls", [])}
 
     top_n = len(candidates)
-    base_w = round(0.95 / top_n, 2)
+    base_w = round(0.98 / top_n, 2)
 
     prompt = ANALYST_PROMPT.format(
         top_n=top_n, lookback=state.get("lookback", 20),
@@ -259,7 +254,7 @@ async def analyst_node(state: V2State) -> dict:
         example_sym=candidates[0] if candidates else "510300",
     )
 
-    # fallback = 等权
+    # fallback = 等权满仓
     fb_w = {s: base_w for s in candidates}
     fallback = {"weights": fb_w, "reasoning": "quant fallback 等权"}
 
@@ -286,13 +281,13 @@ async def analyst_node(state: V2State) -> dict:
     # 强制约束: 只保留候选池内的标的
     raw_w = result.get("weights", {})
     w = {s: max(min(raw_w.get(s, 0), 0.65), 0) for s in candidates}
-    # 补齐: 如果 LLM 漏掉某些候选, 给最低 15%
+    # 补齐: 如果 LLM 漏掉某些候选, 给最低 10%
     for s in candidates:
         if w.get(s, 0) < 0.05:
-            w[s] = 0.15
+            w[s] = 0.10
     total = sum(w.values())
     if total > 0:
-        scale = min(0.95, max(0.85, total)) / total
+        scale = min(1.0, max(0.92, total)) / total
         w = {s: round(v * scale, 4) for s, v in w.items()}
 
     w_named = {_n(s): f"{v:.0%}" for s, v in w.items() if v > 0}
@@ -352,7 +347,10 @@ async def risk_mgr_node(state: V2State) -> dict:
         tw = a_weights
 
     total = sum(tw.values())
-    if total > 0.98:
+    if total > 1.02:
+        s = 0.98 / total
+        tw = {k: round(v * s, 4) for k, v in tw.items()}
+    elif total < 0.92:
         s = 0.95 / total
         tw = {k: round(v * s, 4) for k, v in tw.items()}
     tw = {k: v for k, v in tw.items() if v >= 0.02}

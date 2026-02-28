@@ -31,32 +31,33 @@ logger = get_logger(__name__)
 # ═══════════════════════════════════════════════════════════════
 
 ANALYST_PROMPT = """\
-你是量化ETF分析师。量化引擎已筛选出效率分最高的候选标的:
+你是进攻型量化ETF分析师。效率分=alpha信号，你应该重仓最强标的。
+量化引擎已筛选出效率分最高的候选:
 {market_data_summary}
 
-【重要约束】
-- 你只能在上方候选中分配权重, 不可引入其他标的
-- 必须选择至少2只标的, 单只权重不超过60%
-- 总投资 85%-95%, 其余为现金
-- 持仓标的(标记[HOLDING])仍在候选中时优先保留
-
-【输出】纯JSON, 为每只候选标的分配权重:
+【原则】效率分排名第1的标的就是最强的，给它最高权重。不要为了"分散"而削弱最强标的。
+【约束】
+- 只能在上方候选分配，不可引入新标的
+- 至少2只标的有权重，效率分最高者权重 45-60%
+- 总投资 93%-100%（满仓为王，少留现金）
+- 持仓标的(标记[HOLDING])仍在候选中 → 优先保留不换
+【输出】纯JSON:
 {{
-    "{example}": {{"weight": 0.45, "reason": "15字内"}},
+    "{example}": {{"weight": 0.55, "reason": "10字内"}},
     ...
 }}"""
 
 RISK_MGR_PROMPT = """\
-你是风控管理官。审核以下分配方案:
+你是风控审核官。审核策略师方案，默认放行，仅在极端风险时微调。
 方案: {analyst_proposal}
 数据: {metrics_summary}
 组合: 现金{cash}, 持仓{positions}
 
-【规则】
-- 只能调整权重, 不可增加新标的
-- 波动率>2.5%的标的权重≤45%
-- 总投资维持85-95%
-
+【审核原则】
+- 默认放行策略师方案（效率分排名是量化引擎的最优解）
+- 仅当波动率>3.5%且效率分<0时，才减该标的5%
+- 不可增加新标的，总投资 93%-100%
+- 调整幅度不超过±5%
 【输出】纯JSON:
 {{"target_weights": {{"代码": 0.xx}}, "note": "10字内"}}"""
 
@@ -91,13 +92,13 @@ def data_prep_node(state: AgentState) -> dict:
             metrics[sym] = m
 
     ranked = sorted(metrics.keys(), key=lambda x: metrics[x]["efficiency"], reverse=True)
-    top_3 = ranked[:3]
+    top_n = min(len(ranked), 3)
+    top_picks = ranked[:top_n]
     held = [s for s, q in positions.items() if q > 0]
 
-    # 候选池 = Top-3 + 仍在 Top-5 内的持仓
-    candidates = list(top_3)
+    candidates = list(top_picks)
     for s in held:
-        if s in ranked[:5] and s not in candidates:
+        if s in ranked[:top_n + 2] and s not in candidates:
             candidates.append(s)
 
     filtered = {}
@@ -108,7 +109,7 @@ def data_prep_node(state: AgentState) -> dict:
             if s in held:
                 filtered[s]["holding_qty"] = positions[s]
 
-    logger.info(f"[DataPrep] candidates={candidates}, held_extra={[s for s in held if s not in top_3]}")
+    logger.info(f"[DataPrep] candidates={candidates}, held_extra={[s for s in held if s not in top_picks]}")
     return {"metrics": filtered, "candidates": candidates}
 
 
@@ -132,7 +133,7 @@ async def analyst_node(state: AgentState) -> dict:
     )
 
     n = len(candidates)
-    base_w = round(0.95 / max(n, 2), 2)
+    base_w = round(0.98 / max(n, 2), 2)
     fb = {s: {"weight": base_w, "reason": "等权 fallback"} for s in candidates}
 
     llm_calls = list(state.get("llm_calls", []))
@@ -167,7 +168,7 @@ async def analyst_node(state: AgentState) -> dict:
 
     total = sum(weights.values())
     if total > 0:
-        scale = min(0.95, max(0.85, total)) / total
+        scale = min(1.0, max(0.93, total)) / total
         weights = {s: round(v * scale, 4) for s, v in weights.items() if v > 0}
 
     logger.info(f"[Analyst] {weights}")
