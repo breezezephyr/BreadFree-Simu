@@ -50,7 +50,7 @@ strategy: "RotationStrategy" # "DoubleMAStrategy" "AgentStrategy" "BenchmarkStra
 # LLM 多配置（Agent 策略）：通过 llm.active 切换，API Key 从 .env 中对应 env_key 读取
 # 真实模型/端点名请在 .env 中配置（ARK_MODEL、NVIDIA_MODEL 等），会覆盖此处占位符，勿提交到 git
 llm:
-  active: volcano  # 可选: nvidia | volcano
+  active: volcano  # 可选: nvidia | volcano (nvidia 端点当前 DEGRADED, 回退 volcano)
   providers:
     nvidia:
       base_url: "https://integrate.api.nvidia.com/v1"
