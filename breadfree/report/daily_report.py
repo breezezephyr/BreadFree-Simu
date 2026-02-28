@@ -195,6 +195,47 @@ def _run_backtest(strategy_name: str, backtest_days: int,
     max_dd = calculate_max_drawdown(eq)
     sharpe = calculate_sharpe_ratio(eq)
 
+    final_equity = equities[-1] if equities else initial_cash
+    pool = _get_etf_pool()
+
+    holdings = []
+    for sym, pos in engine.broker.positions.items():
+        qty = pos.quantity
+        avg = pos.avg_price
+        last_price = pos.avg_price
+        if sym in engine.data_map and not engine.data_map[sym].empty:
+            last_price = float(engine.data_map[sym]["close"].iloc[-1])
+        mv = qty * last_price
+        pnl = (last_price - avg) * qty
+        pnl_pct = (last_price / avg - 1) if avg > 0 else 0
+        holdings.append({
+            "symbol": sym, "name": pool.get(sym, sym),
+            "quantity": qty, "avg_price": avg,
+            "last_price": last_price, "market_value": mv,
+            "pnl": pnl, "pnl_pct": pnl_pct,
+            "weight": mv / final_equity if final_equity > 0 else 0,
+        })
+    holdings.sort(key=lambda h: h["market_value"], reverse=True)
+
+    recent_trades = []
+    tx = engine.broker.transaction_history
+    for t in tx[-8:]:
+        d = t["date"]
+        recent_trades.append({
+            "date": d.strftime("%m-%d") if hasattr(d, "strftime") else str(d)[:10],
+            "action": t["action"],
+            "symbol": t["symbol"],
+            "name": pool.get(t["symbol"], t["symbol"]),
+            "price": t["price"],
+            "quantity": t["quantity"],
+        })
+
+    closed = engine.broker.closed_trades
+    top_wins = sorted([c for c in closed if c["return_pct"] > 0],
+                      key=lambda c: c["pnl"], reverse=True)[:3]
+    top_losses = sorted([c for c in closed if c["return_pct"] < 0],
+                        key=lambda c: c["pnl"])[:3]
+
     return {
         "strategy_name": strategy_name,
         "label": meta["label"],
@@ -210,6 +251,12 @@ def _run_backtest(strategy_name: str, backtest_days: int,
             "sharpe_ratio": sharpe,
             "total_trades": len(trade_returns),
         },
+        "holdings": holdings,
+        "recent_trades": recent_trades,
+        "top_wins": top_wins,
+        "top_losses": top_losses,
+        "cash": engine.broker.cash,
+        "cash_pct": engine.broker.cash / final_equity if final_equity > 0 else 1.0,
     }
 
 
@@ -333,6 +380,111 @@ def _build_metrics_bar(m: dict) -> str:
         f'</div>')
 
 
+def _build_holdings_table(result: dict) -> str:
+    holdings = result.get("holdings", [])
+    if not holdings:
+        cash_pct = result.get("cash_pct", 1.0)
+        return f'<p style="font-size:13px;color:#888;">全部现金 ({cash_pct:.0%})</p>'
+
+    pool = _get_etf_pool()
+    rows = ""
+    for h in holdings:
+        pnl_color = "#c23531" if h["pnl"] >= 0 else "#389e0d"
+        rows += f"""
+        <tr>
+            <td>{h['symbol']}</td><td>{h['name']}</td>
+            <td style="text-align:right">{h['quantity']}</td>
+            <td style="text-align:right">{h['avg_price']:.3f}</td>
+            <td style="text-align:right">{h['last_price']:.3f}</td>
+            <td style="text-align:right">{h['market_value']:,.0f}</td>
+            <td style="text-align:right;color:{pnl_color}">{h['pnl']:+,.0f} ({h['pnl_pct']:+.2%})</td>
+            <td style="text-align:right">{h['weight']:.1%}</td>
+        </tr>"""
+
+    cash = result.get("cash", 0)
+    cash_pct = result.get("cash_pct", 0)
+    rows += f"""
+    <tr style="background:#fafafa;">
+        <td colspan="5" style="text-align:right"><i>现金</i></td>
+        <td style="text-align:right">{cash:,.0f}</td>
+        <td></td><td style="text-align:right">{cash_pct:.1%}</td>
+    </tr>"""
+
+    return f"""
+    <table style="border-collapse:collapse;width:100%;font-size:12px;" border="1" cellpadding="4">
+    <thead style="background:#f5f5f5;">
+    <tr><th>代码</th><th>名称</th><th>数量</th><th>成本价</th><th>现价</th>
+        <th>市值</th><th>盈亏</th><th>仓位</th></tr>
+    </thead><tbody>{rows}</tbody></table>"""
+
+
+def _build_recent_trades(result: dict) -> str:
+    trades = result.get("recent_trades", [])
+    if not trades:
+        return '<p style="font-size:13px;color:#888;">本期无交易</p>'
+
+    rows = ""
+    for t in trades:
+        act_color = "#c23531" if t["action"] == "BUY" else "#2f4554"
+        act_label = "买入" if t["action"] == "BUY" else "卖出"
+        rows += f"""
+        <tr>
+            <td>{t['date']}</td>
+            <td style="color:{act_color};font-weight:bold">{act_label}</td>
+            <td>{t['symbol']}</td><td>{t['name']}</td>
+            <td style="text-align:right">{t['price']:.3f}</td>
+            <td style="text-align:right">{t['quantity']}</td>
+        </tr>"""
+
+    return f"""
+    <table style="border-collapse:collapse;width:100%;font-size:12px;" border="1" cellpadding="4">
+    <thead style="background:#f5f5f5;">
+    <tr><th>日期</th><th>方向</th><th>代码</th><th>名称</th><th>价格</th><th>数量</th></tr>
+    </thead><tbody>{rows}</tbody></table>"""
+
+
+def _build_reflection(result: dict) -> str:
+    """根据回测数据自动生成策略反思"""
+    m = result["metrics"]
+    holdings = result.get("holdings", [])
+    wins = result.get("top_wins", [])
+    losses = result.get("top_losses", [])
+    pool = _get_etf_pool()
+    lines = []
+
+    ret, sharpe, dd = m["total_return"], m["sharpe_ratio"], m["max_drawdown"]
+    if ret > 0.15 and sharpe > 2:
+        lines.append(f"本期表现优异 (收益 {ret:.2%}, Sharpe {sharpe:.2f})，策略在趋势行情中捕捉到了有效 alpha。")
+    elif ret > 0:
+        lines.append(f"本期收益 {ret:.2%}，风险调整后 Sharpe {sharpe:.2f}，表现中规中矩。")
+    else:
+        lines.append(f"本期收益 {ret:.2%}，策略处于回撤期，需关注风控熔断阈值。")
+
+    if dd < -0.10:
+        lines.append(f"最大回撤 {dd:.2%} 较深，需警惕连续亏损对资金曲线的侵蚀。")
+
+    if wins:
+        w = wins[0]
+        name = pool.get(w["symbol"], w["symbol"])
+        lines.append(f"最佳交易: {name} 盈利 ¥{w['pnl']:+,.0f} ({w['return_pct']:+.2%})，"
+                     f"买入 {w['buy_price']:.3f} → 卖出 {w['sell_price']:.3f}。")
+
+    if losses:
+        l = losses[0]
+        name = pool.get(l["symbol"], l["symbol"])
+        lines.append(f"最差交易: {name} 亏损 ¥{l['pnl']:+,.0f} ({l['return_pct']:+.2%})，"
+                     f"需反思入场时机是否追高。")
+
+    if len(holdings) == 0:
+        lines.append("当前空仓，等待下一次调仓信号。")
+    else:
+        conc = holdings[0]["weight"]
+        if conc > 0.5:
+            lines.append(f"持仓集中度偏高 ({holdings[0]['name']} 占 {conc:.0%})，注意个股风险。")
+
+    return " ".join(lines)
+
+
 def _build_strategy_section(result: dict, cid: str, section_num: int) -> str:
     m = result["metrics"]
     color = result["color"]
@@ -341,7 +493,22 @@ def _build_strategy_section(result: dict, cid: str, section_num: int) -> str:
         <h3 style="margin-bottom:4px;">策略 {section_num}: {result['label']}</h3>
         <p style="color:#666; font-size:13px; margin:4px 0 8px 0;">{result['desc']}</p>
         {_build_metrics_bar(m)}
-        <img src="cid:{cid}" style="width:100%; max-width:680px; border:1px solid #eee; margin-top:8px;" />
+
+        <details open style="margin-top:10px;">
+        <summary style="font-weight:bold;font-size:13px;cursor:pointer;">当前持仓</summary>
+        {_build_holdings_table(result)}
+        </details>
+
+        <details open style="margin-top:10px;">
+        <summary style="font-weight:bold;font-size:13px;cursor:pointer;">最近交易</summary>
+        {_build_recent_trades(result)}
+        </details>
+
+        <div style="margin-top:10px; padding:8px 12px; background:#f9f6f0; border-radius:4px; font-size:13px;">
+            <b>策略反思:</b> {_build_reflection(result)}
+        </div>
+
+        <img src="cid:{cid}" style="width:100%; max-width:680px; border:1px solid #eee; margin-top:10px;" />
     </div>"""
 
 

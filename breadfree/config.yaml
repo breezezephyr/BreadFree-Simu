@@ -79,7 +79,12 @@ smtp:
   use_ssl: true
   user: ""          # 在 .env 中设置 SMTP_USER 覆盖
   password: ""      # 在 .env 中设置 SMTP_PASSWORD 覆盖
-  report_recipients: []  # 在 .env 中设置 REPORT_RECIPIENTS (逗号分隔) 覆盖
+  # 收件人列表 (支持多个):
+  #   .env 方式: REPORT_RECIPIENTS=a@qq.com,b@163.com,c@gmail.com
+  #   或直接在此配置:
+  report_recipients: []
+  #   - "user1@qq.com"
+  #   - "user2@163.com"
 
 # 定时报告配置
 daily_report:
