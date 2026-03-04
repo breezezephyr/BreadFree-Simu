@@ -93,10 +93,37 @@ def _get_etf_pool() -> dict:
     return dict(cfg.get("etf_pool", {"510300": "沪深300ETF"}))
 
 
-def _fetch_latest_prices(symbols: list, lookback_days: int = 60) -> dict:
+def _report_end_date() -> str:
+    """报告数据截止日：最近交易日（昨日，若为周末则往前推到周五），保证用最新行情而非去年。"""
     now = datetime.now(TZ_SHANGHAI)
-    end_date = now.strftime("%Y%m%d")
-    start_date = (now - timedelta(days=lookback_days + 30)).strftime("%Y%m%d")
+    d = now.date()
+    # 昨天
+    d = d - timedelta(days=1)
+    # 若为周末则推到周五
+    while d.weekday() >= 5:  # 5=周六 6=周日
+        d = d - timedelta(days=1)
+    return d.strftime("%Y%m%d")
+
+
+def _refresh_pool_data_for_report(symbols: list, end_date: str, lookback_days: int = 90):
+    """报告前刷新池内标的行情到 end_date，确保 DB 有最新数据，避免报告只显示去年。"""
+    start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=lookback_days)).strftime("%Y%m%d")
+    fetcher = DataFetcher(data_dir="breadfree/data/cache", data_source="akshare")
+    db = get_db_manager()
+    db.clear_cache()
+    for i, symbol in enumerate(symbols):
+        df = db.get_daily_data(symbol, start_date, end_date)
+        if df.empty or (df.index.max() < pd.to_datetime(end_date) - timedelta(days=5)):
+            fetcher.fetch_a_stock_daily(symbol, start_date, end_date)
+        if (i + 1) % 10 == 0:
+            logger.info(f"[Report] 刷新行情 {i + 1}/{len(symbols)}...")
+    logger.info(f"[Report] 数据截止 {end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}")
+
+
+def _fetch_latest_prices(symbols: list, lookback_days: int = 60, end_date: str = None) -> dict:
+    if end_date is None:
+        end_date = _report_end_date()
+    start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=lookback_days + 30)).strftime("%Y%m%d")
 
     fetcher = DataFetcher(data_dir="breadfree/data/cache", data_source="akshare")
     db = get_db_manager()
@@ -126,10 +153,10 @@ def _fetch_latest_prices(symbols: list, lookback_days: int = 60) -> dict:
     return price_map
 
 
-def calc_top_n_scores(top_n: int = 5, lookback: int = 20) -> list:
+def calc_top_n_scores(top_n: int = 5, lookback: int = 20, end_date: str = None) -> list:
     pool = _get_etf_pool()
     symbols = list(pool.keys())
-    price_map = _fetch_latest_prices(symbols, lookback_days=lookback * 3)
+    price_map = _fetch_latest_prices(symbols, lookback_days=lookback * 3, end_date=end_date)
 
     scored = []
     for symbol in symbols:
@@ -154,20 +181,6 @@ def calc_top_n_scores(top_n: int = 5, lookback: int = 20) -> list:
 # 全市场主动发现
 # ═══════════════════════════════════════════════════════════════
 
-def _run_discovery_scan() -> dict:
-    """执行全市场扫描, 返回发现摘要"""
-    try:
-        discovery = StockDiscovery(
-            min_amount=5e7,
-            min_circ_mv=5e9,
-            efficiency_threshold=0.5,
-            lookback_period=20,
-            max_discover=15,
-        )
-        return discovery.get_discovery_summary()
-    except Exception as e:
-        logger.warning(f"[Report] 主动发现扫描异常: {e}")
-        return {"total_discovered": 0, "top_discoveries": []}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -175,8 +188,9 @@ def _run_discovery_scan() -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 def _run_backtest(strategy_name: str, backtest_days: int,
-                  top_n: int = 5, lookback: int = 20) -> Optional[dict]:
-    """运行单个策略回测, 返回 {equity_curve, metrics, strategy_name}"""
+                  top_n: int = 5, lookback: int = 20, end_date: str = None,
+                  expanded_pool: Dict[str, str] = None) -> Optional[dict]:
+    """运行单个策略回测, 返回 {equity_curve, metrics, strategy_name}。end_date 为报告数据截止日（最近交易日）。"""
     meta = STRATEGY_META.get(strategy_name)
     if not meta:
         return None
@@ -186,15 +200,23 @@ def _run_backtest(strategy_name: str, backtest_days: int,
         logger.warning(f"[Report] {strategy_name} 需要 LLM API Key, 跳过")
         return None
 
-    now = datetime.now(TZ_SHANGHAI)
-    end_date = now.strftime("%Y%m%d")
-    start_date = (now - timedelta(days=backtest_days)).strftime("%Y%m%d")
+    if end_date is None:
+        end_date = _report_end_date()
+    end_dt = datetime.strptime(end_date, "%Y%m%d")
+    start_date = (end_dt - timedelta(days=backtest_days)).strftime("%Y%m%d")
 
     cfg = get_config()
     symbols = list(cfg.get("etf_pool", {"510300": "沪深300ETF"}).keys())
     initial_cash = cfg.get("initial_cash", 100000.0)
 
     kwargs = {"lookback_period": lookback, "hold_period": 20, "top_n": top_n}
+    # DynamicRotation 启用全市场发现，使用扩展池
+    if strategy_name == "DynamicRotation":
+        kwargs["enable_discovery"] = True
+        if expanded_pool:
+            all_symbols = list(expanded_pool.keys())
+            logger.info(f"[Report] DynamicRotation 扩展池: {len(all_symbols)} 个标的（固定池 {len(symbols)} + 发现 {len(all_symbols) - len(symbols)}）")
+            symbols = all_symbols
 
     get_db_manager().clear_cache()
 
@@ -230,6 +252,12 @@ def _run_backtest(strategy_name: str, backtest_days: int,
     final_equity = equities[-1] if equities else initial_cash
     pool = _get_etf_pool()
 
+    # 构建标的名称映射：固定池 + 发现的新标的（DynamicRotation）
+    name_map = dict(pool)
+    if strategy_name == "DynamicRotation" and hasattr(engine.strategy, "get_discovery_log"):
+        for disc in engine.strategy.get_discovery_log():
+            name_map[disc["symbol"]] = disc["name"]
+
     holdings = []
     for sym, pos in engine.broker.positions.items():
         qty = pos.quantity
@@ -241,7 +269,7 @@ def _run_backtest(strategy_name: str, backtest_days: int,
         pnl = (last_price - avg) * qty
         pnl_pct = (last_price / avg - 1) if avg > 0 else 0
         holdings.append({
-            "symbol": sym, "name": pool.get(sym, sym),
+            "symbol": sym, "name": name_map.get(sym, sym),
             "quantity": qty, "avg_price": avg,
             "last_price": last_price, "market_value": mv,
             "pnl": pnl, "pnl_pct": pnl_pct,
@@ -257,7 +285,7 @@ def _run_backtest(strategy_name: str, backtest_days: int,
             "date": d.strftime("%m-%d") if hasattr(d, "strftime") else str(d)[:10],
             "action": t["action"],
             "symbol": t["symbol"],
-            "name": pool.get(t["symbol"], t["symbol"]),
+            "name": name_map.get(t["symbol"], t["symbol"]),
             "price": t["price"],
             "quantity": t["quantity"],
         })
@@ -645,7 +673,7 @@ def _build_signal_section(results: List[dict]) -> str:
 
 
 def _build_html_report(top_scores: list, results: List[dict], report_date: str,
-                       discovery_summary: dict = None) -> str:
+                       discovery_summary: dict = None, data_cutoff: str = None) -> str:
     ranking_table = _build_ranking_table(top_scores) if top_scores else "<p>暂无数据</p>"
     top_n = len(top_scores) if top_scores else 0
 
@@ -670,6 +698,7 @@ def _build_html_report(top_scores: list, results: List[dict], report_date: str,
     signal_html = _build_signal_section(results)
 
     strategy_names = " / ".join(r["strategy_name"] for r in results)
+    cutoff_note = f" | 数据截止: {data_cutoff}" if data_cutoff else ""
 
     html = f"""\
 <!DOCTYPE html>
@@ -680,7 +709,7 @@ def _build_html_report(top_scores: list, results: List[dict], report_date: str,
 <h2 style="border-bottom:2px solid #c23531; padding-bottom:8px;">
     BreadFree 每日多策略决策报告
 </h2>
-<p style="color:#888; font-size:13px;">报告日期: {report_date} | 策略池: {strategy_names}</p>
+<p style="color:#888; font-size:13px;">报告日期: {report_date}{cutoff_note} | 策略池: {strategy_names}</p>
 
 <h3>Top {top_n} 标的因子排名 (全池量化评分)</h3>
 {ranking_table}
@@ -712,7 +741,7 @@ def _build_html_report(top_scores: list, results: List[dict], report_date: str,
 # ═══════════════════════════════════════════════════════════════
 
 def generate_and_send_report():
-    """生成并发送每日多策略报告"""
+    """生成并发送每日多策略报告。使用最近交易日作为数据截止日并先刷新行情，保证报告为最新数据。"""
     now = datetime.now(TZ_SHANGHAI)
     report_date = now.strftime("%Y-%m-%d %H:%M")
     date_short = now.strftime("%m/%d")
@@ -722,25 +751,46 @@ def generate_and_send_report():
     lookback = cfg.get("lookback_period", 20)
     backtest_days = cfg.get("backtest_days", 120)
 
-    logger.info(f"[Report] 开始生成每日多策略报告 ({report_date})")
+    report_end = _report_end_date()
+    data_cutoff_label = f"{report_end[:4]}-{report_end[4:6]}-{report_end[6:8]}"
+    logger.info(f"[Report] 开始生成每日多策略报告 ({report_date})，数据截止 {data_cutoff_label}")
+
+    pool = _get_etf_pool()
+    symbols = list(pool.keys())
+    logger.info("[Report] 刷新池内行情至最近交易日...")
+    _refresh_pool_data_for_report(symbols, report_end, lookback_days=90)
 
     # 1) Top-N 因子排名
     logger.info(f"[Report] 计算 Top-{top_n} 因子得分...")
-    top_scores = calc_top_n_scores(top_n=top_n, lookback=lookback)
+    top_scores = calc_top_n_scores(top_n=top_n, lookback=lookback, end_date=report_end)
     if not top_scores:
         logger.warning("[Report] 无有效标的得分, 跳过发送")
         return False
     logger.info(f"[Report] Top-{top_n}: {[f'{s['symbol']}-{s['name']}' for s in top_scores]}")
 
-    # 2) 全市场主动发现扫描
+    # 2) 全市场主动发现扫描（获取扩展池，供 DynamicRotation 使用）
     logger.info("[Report] 执行全市场主动发现扫描...")
-    discovery_summary = _run_discovery_scan()
+    expanded_pool = None
+    try:
+        discovery = StockDiscovery(
+            min_amount=5e7,
+            min_circ_mv=5e9,
+            efficiency_threshold=0.5,
+            lookback_period=lookback,
+            max_discover=30,
+        )
+        expanded_pool = discovery.get_expanded_pool(end_date=report_end, max_expand=10)
+        discovery_summary = discovery.get_discovery_summary(report_end)
+    except Exception as e:
+        logger.warning(f"[Report] 主动发现扫描异常: {e}")
+        discovery_summary = {"total_discovered": 0, "top_discoveries": []}
 
-    # 3) 运行多种策略回测 (含新增 DynamicRotation)
+    # 3) 运行多种策略回测（DynamicRotation 用扩展池）
     strategy_order = ["RotationStrategy", "DynamicRotation", "AgentStrategyV2", "EffiA"]
     results = []
     for name in strategy_order:
-        r = _run_backtest(name, backtest_days, top_n=top_n, lookback=lookback)
+        r = _run_backtest(name, backtest_days, top_n=top_n, lookback=lookback, 
+                         end_date=report_end, expanded_pool=expanded_pool)
         if r:
             results.append(r)
 
@@ -759,9 +809,10 @@ def generate_and_send_report():
         logger.info(f"[Report] 生成 {r['strategy_name']} 收益曲线...")
         images[cid] = _generate_single_chart(r)
 
-    # 5) 组装 HTML
+    # 5) 组装 HTML（注明数据截止日）
     html = _build_html_report(top_scores, results, report_date,
-                              discovery_summary=discovery_summary)
+                              discovery_summary=discovery_summary,
+                              data_cutoff=data_cutoff_label)
 
     subject = (f"BreadFree 多策略报告 {date_short} | "
                + ", ".join(r["strategy_name"] for r in results))

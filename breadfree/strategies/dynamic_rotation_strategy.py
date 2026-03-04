@@ -200,10 +200,15 @@ class DynamicRotationStrategy(BreadFreeStrategy):
     def _get_valid_symbols(self) -> List[str]:
         valid = []
         all_symbols = set(self.symbols) | self._expanded_symbols
+        cfg = get_config()
+        fixed_pool = set(cfg.get("etf_pool", {}).keys())
         for symbol in all_symbols:
             if self.suspension_flags.get(symbol, False):
                 continue
-            if len(self.history.get(symbol, [])) < self.min_data_length:
+            hist_len = len(self.history.get(symbol, []))
+            # 新发现标的用更宽松的数据要求：只需 lookback_period 天（而非 min_data_length = 30-40）
+            required = self.lookback_period if symbol not in fixed_pool else self.min_data_length
+            if hist_len < required:
                 continue
             valid.append(symbol)
         return valid

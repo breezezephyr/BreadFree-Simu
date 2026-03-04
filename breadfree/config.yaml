@@ -89,6 +89,7 @@ discovery:
   min_circ_mv: 5000000000  # 最低流通市值 (元), 50亿
   min_turnover: 0.3        # 最低换手率 (%)
   max_discover: 30         # 最多发现标的数
+  max_candidates_to_score: 60  # 效率分计算最多处理的候选数，避免 178 个串行请求导致报告卡住
   efficiency_threshold: 0.5 # 效率分阈值
   cache_hours: 12          # 扫描缓存时长 (小时)
   scan_etf: true           # 扫描 ETF

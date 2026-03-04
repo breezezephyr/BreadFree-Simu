@@ -256,10 +256,16 @@ class StockDiscovery:
     def _calc_efficiency_scores(
         self, candidates: pd.DataFrame, end_date: str
     ) -> List[dict]:
-        """为候选标的计算效率分 (复用现有 DataFetcher + 效率分公式)"""
+        """为候选标的计算效率分 (复用现有 DataFetcher + 效率分公式)。限制处理数量并打进度日志，避免 178 个串行请求卡住报告。"""
         from .data_fetcher import DataFetcher
         from .database import get_db_manager
         from ..utils.metrics import calculate_efficiency_metrics
+
+        cfg = get_config().get("discovery", {})
+        max_to_score = int(cfg.get("max_candidates_to_score", 60))
+        if len(candidates) > max_to_score:
+            candidates = candidates.head(max_to_score)
+            logger.info(f"[Discovery] 候选数过多，仅对前 {max_to_score} 个计算效率分，避免长时间阻塞")
 
         fetcher = DataFetcher(
             data_dir=os.path.join(os.path.dirname(__file__), "cache"),
@@ -276,7 +282,10 @@ class StockDiscovery:
 
         db.preload_symbols(symbols, start_date, end_date)
 
-        for _, row in candidates.iterrows():
+        total = len(candidates)
+        for idx, (_, row) in enumerate(candidates.iterrows()):
+            if (idx + 1) % 15 == 0 or idx == 0 or idx == total - 1:
+                logger.info(f"[Discovery] 计算效率分 {idx + 1}/{total}...")
             symbol = str(row["symbol"]).zfill(6)
 
             df = db.get_preloaded(symbol)
