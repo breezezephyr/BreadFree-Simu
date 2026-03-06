@@ -43,6 +43,11 @@ MODELS_TO_TEST = [
     "qwen/qwen3-next-80b-a3b-thinking",
     "qwen/qwen3.5-397b-a17b",
     "moonshotai/kimi-k2-instruct-0905",
+    "mistralai/mistral-large-3-675b-instruct-2512",
+    "moonshotai/kimi-k2-instruct",
+    "z-ai/glm4.7",
+    "minimaxai/minimax-m2.1",
+    "google/gemma-3-27b-it",
 ]
 
 # 适用场景简要说明（按模型 ID 匹配）
@@ -56,12 +61,17 @@ MODEL_SCENARIOS = {
     "qwen/qwen3-next-80b-a3b-thinking": "深度推理、思考链、数学/逻辑",
     "qwen/qwen3.5-397b-a17b": "超大参数量、综合能力、高要求场景",
     "moonshotai/kimi-k2-instruct-0905": "通用对话、长上下文、Kimi K2",
+    "mistralai/mistral-large-3-675b-instruct-2512": "超大参数量指令模型、通用/复杂任务",
+    "moonshotai/kimi-k2-instruct": "通用对话、长上下文（Kimi K2）",
+    "z-ai/glm4.7": "智谱 GLM-4.7、通用/多语言",
+    "minimaxai/minimax-m2.1": "通用对话、多轮",
+    "google/gemma-3-27b-it": "中小规模指令微调、快速推理",
 }
 
 TEST_QUERY = "What is quantitative trading? Answer in one sentence."
 TEST_PROMPT = "You are a concise financial assistant."
 MAX_TOKENS = 128
-TIMEOUT = 20
+TIMEOUT = 10
 
 
 def test_one_model_stream(model_id: str) -> dict:
@@ -79,6 +89,7 @@ def test_one_model_stream(model_id: str) -> dict:
     t_start = time.perf_counter()
     ttft_ms = None
     t_first = None
+    t_first_chunk = None  # 首个 chunk 到达时间（部分模型不在 delta.content 里返回内容时用作 TTFT 备选）
     completion_tokens = None
     prompt_tokens = None
     total_content_len = 0
@@ -92,6 +103,8 @@ def test_one_model_stream(model_id: str) -> dict:
         )
         for chunk in stream:
             t_now = time.perf_counter()
+            if t_first_chunk is None:
+                t_first_chunk = t_now
             if ttft_ms is None and chunk.choices and chunk.choices[0].delta.content:
                 ttft_ms = int((t_now - t_start) * 1000)
                 t_first = t_now
@@ -107,9 +120,13 @@ def test_one_model_stream(model_id: str) -> dict:
             completion_tokens = 0
         if prompt_tokens is None:
             prompt_tokens = 0
-        # 输出 TPS = 输出 token 数 / 从首 token 到结束的时长(秒)
-        if t_first is not None and (t_end - t_first) > 0 and completion_tokens:
-            output_tps = round(completion_tokens / (t_end - t_first), 1)
+        # 部分模型不在 delta.content 里返回内容，用「首 chunk 时间」作为 TTFT 备选
+        if ttft_ms is None and t_first_chunk is not None:
+            ttft_ms = int((t_first_chunk - t_start) * 1000)
+        # 输出 TPS：优先用首 token 到结束的时长，否则用首 chunk 到结束
+        t_from = t_first if t_first is not None else t_first_chunk
+        if t_from is not None and (t_end - t_from) > 0 and completion_tokens:
+            output_tps = round(completion_tokens / (t_end - t_from), 1)
         else:
             output_tps = None
         return {
@@ -158,23 +175,22 @@ def main():
         if i < len(MODELS_TO_TEST):
             time.sleep(1)
 
-    # 报告表
+    # 报告表（仅输出可用模型）
+    available_results = [r for r in results if r["available"]]
     print()
     print("=" * 90)
-    print("性能与适用场景报告")
+    print("性能与适用场景报告（仅可用模型）")
     print("=" * 90)
-    print(f"{'Model':<45} {'可用':<5} {'首Token(ms)':<12} {'输出TPS':<12} {'适用场景'}")
+    print(f"{'Model':<45} {'首Token(ms)':<12} {'输出TPS':<12} {'适用场景'}")
     print("-" * 90)
-    for r in results:
+    for r in available_results:
         mid = r["model_id"][:43] + (".." if len(r["model_id"]) > 43 else "")
-        ok = "是" if r["available"] else "否"
         ttft = str(r["ttft_ms"]) if r["ttft_ms"] is not None else "-"
         tps = str(r["output_tps"]) if r["output_tps"] is not None else "-"
         scenario = r["scenario"][:28] + (".." if len(r["scenario"]) > 28 else "")
-        print(f"{mid:<45} {ok:<5} {ttft:<12} {tps:<12} {scenario}")
+        print(f"{mid:<45} {ttft:<12} {tps:<12} {scenario}")
     print("=" * 90)
-    ok_count = sum(1 for r in results if r["available"])
-    print(f"合计: {ok_count}/{len(results)} 个模型可用")
+    print(f"合计: 以上 {len(available_results)} 个模型可用（共测试 {len(results)} 个）")
     print()
     print("说明: TTFT=从请求发出到收到首个输出 token 的耗时；输出 TPS=生成阶段每秒输出 token 数。")
     print("      适用场景为基于模型类型的建议，实际表现以你账户下的实测为准。")

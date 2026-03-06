@@ -672,8 +672,73 @@ def _build_signal_section(results: List[dict]) -> str:
     </div>"""
 
 
+def _build_pool_entries_section(pool_entries: dict, data_cutoff: str = None) -> str:
+    """构建「每日选股入池」区块：固定池 Top-N 入选 + 发现池新入（非固定池）。"""
+    fixed = pool_entries.get("fixed_pool_top_n") or []
+    discovery_new = pool_entries.get("discovery_new") or []
+
+    cutoff_note = f" 数据截止: {data_cutoff}" if data_cutoff else ""
+
+    fixed_rows = ""
+    for item in fixed:
+        fixed_rows += f"""
+        <tr>
+            <td style="text-align:center">{item.get('rank', '-')}</td>
+            <td>{item.get('symbol', '')}</td>
+            <td>{item.get('name', '')}</td>
+            <td style="text-align:right">{item.get('close', 0):.3f}</td>
+            <td style="text-align:right">{(item.get('momentum') or 0) * 100:+.2f}%</td>
+            <td style="text-align:right;font-weight:bold">{item.get('efficiency', 0):.2f}</td>
+            <td style="text-align:center">{_signal_html(item.get('efficiency', 0))}</td>
+        </tr>"""
+
+    discovery_rows = ""
+    for i, d in enumerate(discovery_new[:10], 1):
+        eff = d.get("efficiency", 0)
+        mom = d.get("momentum", 0)
+        discovery_rows += f"""
+        <tr>
+            <td style="text-align:center">{i}</td>
+            <td>{d.get('symbol', '')}</td>
+            <td>{d.get('name', '')} <span style="font-size:10px;color:#999;">[新入]</span></td>
+            <td style="text-align:right">{d.get('latest_price', 0):.2f}</td>
+            <td style="text-align:right">{mom * 100:+.2f}%</td>
+            <td style="text-align:right">{d.get('volatility', 0) * 100:.2f}%</td>
+            <td style="text-align:right;font-weight:bold">{eff:.2f}</td>
+            <td style="text-align:center">{_signal_html(eff)}</td>
+        </tr>"""
+
+    fixed_table = ""
+    if fixed_rows:
+        fixed_table = f"""
+        <p style="font-size:12px; color:#666; margin:4px 0 6px 0;"><b>固定池入选</b>（当日因子排名 Top-N）</p>
+        <table style="border-collapse:collapse; width:100%; font-size:12px;" border="1" cellpadding="5">
+        <thead style="background:#f5f5f5;">
+        <tr><th>排名</th><th>代码</th><th>名称</th><th>最新价</th><th>动量</th><th>效率分</th><th>信号</th></tr>
+        </thead><tbody>{fixed_rows}</tbody></table>"""
+
+    discovery_table = ""
+    if discovery_rows:
+        discovery_table = f"""
+        <p style="font-size:12px; color:#666; margin:12px 0 6px 0;"><b>发现池新入</b>（全市场扫描，不在固定池）</p>
+        <table style="border-collapse:collapse; width:100%; font-size:12px;" border="1" cellpadding="5">
+        <thead style="background:#f5f5f5;">
+        <tr><th>序号</th><th>代码</th><th>名称</th><th>最新价</th><th>动量</th><th>波动率</th><th>效率分</th><th>信号</th></tr>
+        </thead><tbody>{discovery_rows}</tbody></table>"""
+
+    return f"""
+    <div style="margin-top:16px; padding:12px; background:#f0f7ff; border:1px solid #91caff; border-radius:6px;">
+        <h3 style="margin:0 0 8px 0;">📋 每日选股入池</h3>
+        <p style="font-size:12px; color:#666; margin:0 0 10px 0;">当日进入可投股票池的标的汇总。{cutoff_note}</p>
+        {fixed_table}
+        {discovery_table}
+        {'' if (fixed_rows or discovery_rows) else '<p style="font-size:13px; color:#888;">暂无入池数据</p>'}
+    </div>"""
+
+
 def _build_html_report(top_scores: list, results: List[dict], report_date: str,
-                       discovery_summary: dict = None, data_cutoff: str = None) -> str:
+                       discovery_summary: dict = None, data_cutoff: str = None,
+                       pool_entries: dict = None) -> str:
     ranking_table = _build_ranking_table(top_scores) if top_scores else "<p>暂无数据</p>"
     top_n = len(top_scores) if top_scores else 0
 
@@ -694,6 +759,8 @@ def _build_html_report(top_scores: list, results: List[dict], report_date: str,
     discovery_html = ""
     if discovery_summary:
         discovery_html = _build_discovery_section(discovery_summary)
+
+    pool_entries_html = _build_pool_entries_section(pool_entries, data_cutoff) if pool_entries else ""
 
     signal_html = _build_signal_section(results)
 
@@ -716,6 +783,8 @@ def _build_html_report(top_scores: list, results: List[dict], report_date: str,
 <p style="font-size:12px; color:#999; margin-top:4px;">
 效率分 = (动量 / 区间波动率) &times; R&sup2;&ensp;|&ensp;动量 = 20日ROC&ensp;|&ensp;R&sup2; 衡量趋势线性度
 </p>
+
+{pool_entries_html}
 
 {discovery_html}
 
@@ -766,7 +835,7 @@ def generate_and_send_report():
     if not top_scores:
         logger.warning("[Report] 无有效标的得分, 跳过发送")
         return False
-    logger.info(f"[Report] Top-{top_n}: {[f'{s['symbol']}-{s['name']}' for s in top_scores]}")
+    logger.info(f"[Report] Top-{top_n}: {[s['symbol'] + '-' + s['name'] for s in top_scores]}")
 
     # 2) 全市场主动发现扫描（获取扩展池，供 DynamicRotation 使用）
     logger.info("[Report] 执行全市场主动发现扫描...")
@@ -784,6 +853,13 @@ def generate_and_send_report():
     except Exception as e:
         logger.warning(f"[Report] 主动发现扫描异常: {e}")
         discovery_summary = {"total_discovered": 0, "top_discoveries": []}
+
+    # 入池汇总：固定池 Top-N + 发现池新入（不在固定池的 discovery 标的）
+    pool_entries = {
+        "data_cutoff": data_cutoff_label,
+        "fixed_pool_top_n": top_scores,
+        "discovery_new": [d for d in discovery_summary.get("top_discoveries", []) if d.get("symbol") not in pool],
+    }
 
     # 3) 运行多种策略回测（DynamicRotation 用扩展池）
     strategy_order = ["RotationStrategy", "DynamicRotation", "AgentStrategyV2", "EffiA"]
@@ -809,10 +885,11 @@ def generate_and_send_report():
         logger.info(f"[Report] 生成 {r['strategy_name']} 收益曲线...")
         images[cid] = _generate_single_chart(r)
 
-    # 5) 组装 HTML（注明数据截止日）
+    # 5) 组装 HTML（注明数据截止日，含每日选股入池区块）
     html = _build_html_report(top_scores, results, report_date,
                               discovery_summary=discovery_summary,
-                              data_cutoff=data_cutoff_label)
+                              data_cutoff=data_cutoff_label,
+                              pool_entries=pool_entries)
 
     subject = (f"BreadFree 多策略报告 {date_short} | "
                + ", ".join(r["strategy_name"] for r in results))
