@@ -588,7 +588,7 @@ def _build_discovery_section(discovery_summary: dict) -> str:
         return """
         <div style="margin-top:16px; padding:12px; background:#f9f9f9; border-radius:6px;">
             <h3 style="margin:0 0 8px 0;">🔍 全市场主动发现</h3>
-            <p style="font-size:13px; color:#888;">本次扫描未发现符合条件的新标的 (或网络不可用)</p>
+            <p style="font-size:13px; color:#888;">本次扫描未发现符合条件的新标的 (网络暂不可用且无历史缓存)</p>
         </div>"""
 
     rows = ""
@@ -611,12 +611,22 @@ def _build_discovery_section(discovery_summary: dict) -> str:
 
     avg_eff = discovery_summary.get("avg_efficiency", 0)
     max_eff = discovery_summary.get("max_efficiency", 0)
+    is_stale = discovery_summary.get("is_stale_cache", False)
+    stale_time = discovery_summary.get("stale_cache_time", "")
+
+    stale_note = ""
+    if is_stale:
+        stale_note = (
+            f'<p style="font-size:11px; color:#d48806; margin:4px 0 8px 0; padding:4px 8px; '
+            f'background:#fffbe6; border-left:3px solid #faad14; border-radius:2px;">'
+            f'⚠️ 当前网络不可用，数据来源：历史缓存（扫描时间：{stale_time}）</p>'
+        )
 
     return f"""
     <div style="margin-top:16px; padding:12px; background:#fffbe6; border:1px solid #ffe58f; border-radius:6px;">
         <h3 style="margin:0 0 8px 0;">🔍 全市场主动发现 <span style="font-size:12px;color:#888;font-weight:normal;">
             发现 {len(discoveries)} 个高效率标的 | 平均效率分 {avg_eff:.2f} | 最高 {max_eff:.2f}</span></h3>
-        <p style="font-size:12px; color:#666; margin:0 0 8px 0;">
+        {stale_note}<p style="font-size:12px; color:#666; margin:0 0 8px 0;">
             从全 A 股/ETF 市场扫描, 筛选流动性充足 (日成交额&gt;5000万, 流通市值&gt;50亿) 且效率分&gt;0.5 的标的.
             标有 ★ 的标的为新发现, 不在固定池内.
         </p>

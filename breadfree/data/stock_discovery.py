@@ -37,7 +37,13 @@ os.makedirs(_CACHE_DIR, exist_ok=True)
 # L1: 东方财富全市场行情 (curl_cffi)
 # ═══════════════════════════════════════════════════════════════
 
-_SPOT_URL = "https://82.push2.eastmoney.com/api/qt/clist/get"
+# 东方财富 push2 服务器列表，按优先级尝试（IP 会周期性变更，多候选提高成功率）
+_SPOT_URL_CANDIDATES = [
+    "https://push2.eastmoney.com/api/qt/clist/get",
+    "https://82.push2.eastmoney.com/api/qt/clist/get",
+    "https://83.push2.eastmoney.com/api/qt/clist/get",
+]
+_SPOT_URL = _SPOT_URL_CANDIDATES[0]
 
 _STOCK_PARAMS = {
     "pn": "1", "pz": "200", "po": "1", "np": "1",
@@ -63,14 +69,17 @@ def _fetch_spot_page(params: dict, page: int = 1) -> List[dict]:
         return []
 
     p = {**params, "pn": str(page)}
-    try:
-        r = cffi_req.get(_SPOT_URL, params=p, timeout=20, impersonate="chrome")
-        data = r.json()
-    except Exception:
-        return []
-
-    diff = (data.get("data") or {}).get("diff", [])
-    return diff if diff else []
+    # 每个服务器只等待 6 秒，失败立即换下一个，总预算约 30 秒
+    for url in _SPOT_URL_CANDIDATES:
+        try:
+            r = cffi_req.get(url, params=p, timeout=6, impersonate="chrome")
+            data = r.json()
+            diff = (data.get("data") or {}).get("diff", [])
+            if diff:
+                return diff
+        except Exception:
+            continue
+    return []
 
 
 def _fetch_all_spots(params: dict, max_pages: int = 10) -> pd.DataFrame:
@@ -179,6 +188,7 @@ class StockDiscovery:
 
         self._last_scan: Optional[pd.DataFrame] = None
         self._last_scan_time: Optional[datetime] = None
+        self._using_stale_cache: bool = False
 
     def _is_cache_valid(self) -> bool:
         if self._last_scan is None or self._last_scan_time is None:
@@ -204,6 +214,21 @@ class StockDiscovery:
             df.to_csv(cache_file, index=False)
         except Exception as e:
             logger.warning(f"[Discovery] Cache save failed: {e}")
+
+    def _load_stale_file_cache(self) -> Optional[pd.DataFrame]:
+        """加载文件缓存，不检查过期时间（作为网络失败时的最后回退）"""
+        cache_file = os.path.join(_CACHE_DIR, "latest_scan.csv")
+        if not os.path.exists(cache_file):
+            return None
+        try:
+            df = pd.read_csv(cache_file)
+            if df.empty:
+                return None
+            age_hours = (time.time() - os.path.getmtime(cache_file)) / 3600
+            logger.info(f"[Discovery] 加载过期缓存 (距上次扫描 {age_hours:.1f} 小时)")
+            return df
+        except Exception:
+            return None
 
     def _fetch_market_data(self) -> pd.DataFrame:
         """拉取全市场行情数据, 合并 ETF + 个股"""
@@ -343,12 +368,14 @@ class StockDiscovery:
             list of dict, 每个 dict 包含 symbol, name, efficiency, momentum 等
         """
         if self._is_cache_valid():
+            # 保持 _using_stale_cache 不变，避免二次调用时覆盖过期缓存标志
             return self._last_scan.to_dict("records") if not self._last_scan.empty else []
 
         file_cache = self._load_file_cache()
         if file_cache is not None and not file_cache.empty:
             self._last_scan = file_cache
             self._last_scan_time = datetime.now()
+            self._using_stale_cache = False
             logger.info(f"[Discovery] 从文件缓存加载 {len(file_cache)} 条扫描结果")
             return file_cache.to_dict("records")
 
@@ -359,7 +386,14 @@ class StockDiscovery:
 
         market_data = self._fetch_market_data()
         if market_data.empty:
-            logger.warning("[Discovery] 无法获取市场数据, 返回空结果")
+            logger.warning("[Discovery] 无法获取市场数据, 尝试回退到过期缓存...")
+            stale = self._load_stale_file_cache()
+            if stale is not None:
+                self._last_scan = stale
+                self._last_scan_time = datetime.now()
+                self._using_stale_cache = True
+                return stale.to_dict("records")
+            logger.warning("[Discovery] 无任何缓存可用, 返回空结果")
             return []
 
         filtered = self._apply_liquidity_filter(market_data)
@@ -379,7 +413,17 @@ class StockDiscovery:
             result_df = pd.DataFrame(scored)
             self._last_scan = result_df
             self._last_scan_time = datetime.now()
+            self._using_stale_cache = False
             self._save_file_cache(result_df)
+        elif not scored:
+            # 新扫描无结果，回退到过期缓存（可能是筛选条件过严或数据异常）
+            stale = self._load_stale_file_cache()
+            if stale is not None:
+                logger.info("[Discovery] 新扫描无结果，回退到过期缓存")
+                self._last_scan = stale
+                self._last_scan_time = datetime.now()
+                self._using_stale_cache = True
+                return stale.to_dict("records")
 
         return scored
 
@@ -417,6 +461,15 @@ class StockDiscovery:
     def get_discovery_summary(self, end_date: str = None) -> dict:
         """生成发现摘要, 用于邮件报告"""
         discovered = self.discover(end_date)
+        is_stale = self._using_stale_cache
+
+        # 获取缓存文件修改时间作为数据时间戳
+        stale_cache_time = None
+        if is_stale:
+            cache_file = os.path.join(_CACHE_DIR, "latest_scan.csv")
+            if os.path.exists(cache_file):
+                mtime = os.path.getmtime(cache_file)
+                stale_cache_time = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
 
         if not discovered:
             return {
@@ -425,6 +478,8 @@ class StockDiscovery:
                 "top_discoveries": [],
                 "avg_efficiency": 0,
                 "scan_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "is_stale_cache": False,
+                "stale_cache_time": None,
             }
 
         efficiencies = [d["efficiency"] for d in discovered]
@@ -435,4 +490,6 @@ class StockDiscovery:
             "avg_efficiency": float(np.mean(efficiencies)),
             "max_efficiency": float(max(efficiencies)),
             "scan_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "is_stale_cache": is_stale,
+            "stale_cache_time": stale_cache_time,
         }
