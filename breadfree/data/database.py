@@ -25,6 +25,7 @@ from .db_models import (
     Base, StockInfo, DailyData, MonthlyData,
     TechnicalIndicators, NewsArticle, MarketIntelDaily,
     SectorInfo, StockSectorMapping, SentimentData,
+    DailyFactors, DiscoveryScan, RebalanceLog,
 )
 from ..utils.logger import get_logger
 
@@ -258,6 +259,485 @@ class DatabaseManager:
             return None
         finally:
             session.close()
+
+    # ──────────────────────────────────────────────────────────
+    # 选股择时数据持久化
+    # ──────────────────────────────────────────────────────────
+
+    def save_factor_snapshot(self, records: List[dict]) -> int:
+        """
+        批量保存每日全池因子快照到 daily_factors 表（INSERT OR REPLACE）。
+
+        Args:
+            records: list of dict，每条需包含 trade_date, symbol，其余字段可选。
+        Returns:
+            实际写入行数。
+        """
+        if not records:
+            return 0
+
+        sql = text("""
+            INSERT OR REPLACE INTO daily_factors
+                (trade_date, symbol, name, close,
+                 momentum, volatility, r2, efficiency,
+                 accel, composite, drawdown_from_high,
+                 pool_rank, is_selected, top_n, lookback_period, created_at)
+            VALUES
+                (:trade_date, :symbol, :name, :close,
+                 :momentum, :volatility, :r2, :efficiency,
+                 :accel, :composite, :drawdown_from_high,
+                 :pool_rank, :is_selected, :top_n, :lookback_period, :created_at)
+        """)
+
+        rows = []
+        for r in records:
+            td = r.get("trade_date")
+            if td and not isinstance(td, date):
+                td = pd.to_datetime(td).date()
+            rows.append({
+                "trade_date": td,
+                "symbol": r.get("symbol", ""),
+                "name": r.get("name", ""),
+                "close": r.get("close"),
+                "momentum": r.get("momentum"),
+                "volatility": r.get("volatility"),
+                "r2": r.get("r2"),
+                "efficiency": r.get("efficiency"),
+                "accel": r.get("accel"),
+                "composite": r.get("composite"),
+                "drawdown_from_high": r.get("drawdown_from_high"),
+                "pool_rank": r.get("pool_rank"),
+                "is_selected": int(bool(r.get("is_selected", False))),
+                "top_n": r.get("top_n"),
+                "lookback_period": r.get("lookback_period"),
+                "created_at": datetime.now(),
+            })
+
+        with self.engine.begin() as conn:
+            conn.execute(sql, rows)
+
+        logger.info(f"[DB] 保存因子快照 {len(rows)} 条 (trade_date={rows[0]['trade_date']})")
+        return len(rows)
+
+    def save_discovery_scan(self, records: List[dict], scan_date: str,
+                            is_stale_cache: bool = False) -> int:
+        """
+        批量保存全市场发现扫描结果到 discovery_scan 表（INSERT OR REPLACE）。
+
+        Args:
+            records: list of dict，来自 StockDiscovery.discover() 返回值。
+            scan_date: 扫描日期 YYYYMMDD。
+            is_stale_cache: 数据是否来自过期缓存。
+        Returns:
+            实际写入行数。
+        """
+        if not records:
+            return 0
+
+        sql = text("""
+            INSERT OR REPLACE INTO discovery_scan
+                (scan_date, symbol, name, asset_type,
+                 latest_price, circ_mv, amount, turnover_rate,
+                 momentum, volatility, r2, efficiency,
+                 scan_rank, is_stale_cache, created_at)
+            VALUES
+                (:scan_date, :symbol, :name, :asset_type,
+                 :latest_price, :circ_mv, :amount, :turnover_rate,
+                 :momentum, :volatility, :r2, :efficiency,
+                 :scan_rank, :is_stale_cache, :created_at)
+        """)
+
+        sd = pd.to_datetime(scan_date).date() if scan_date else date.today()
+        rows = []
+        for rank, r in enumerate(records, 1):
+            rows.append({
+                "scan_date": sd,
+                "symbol": r.get("symbol", ""),
+                "name": r.get("name", ""),
+                "asset_type": r.get("asset_type", "stock"),
+                "latest_price": r.get("latest_price"),
+                "circ_mv": r.get("circ_mv"),
+                "amount": r.get("amount"),
+                "turnover_rate": r.get("turnover_rate"),
+                "momentum": r.get("momentum"),
+                "volatility": r.get("volatility"),
+                "r2": r.get("r2"),
+                "efficiency": r.get("efficiency"),
+                "scan_rank": r.get("scan_rank", rank),
+                "is_stale_cache": int(is_stale_cache),
+                "created_at": datetime.now(),
+            })
+
+        with self.engine.begin() as conn:
+            conn.execute(sql, rows)
+
+        logger.info(f"[DB] 保存发现扫描 {len(rows)} 条 (scan_date={sd}, stale={is_stale_cache})")
+        return len(rows)
+
+    def save_rebalance_log(self, record: dict) -> None:
+        """
+        保存调仓/择时决策记录（INSERT OR REPLACE）。
+
+        Args:
+            record: dict，需包含 trade_date, strategy；其余字段可选。
+        """
+        sql = text("""
+            INSERT OR REPLACE INTO rebalance_log
+                (trade_date, strategy, trigger_type, trigger_score,
+                 top_n, lookback_period, selected_json, signal_json, created_at)
+            VALUES
+                (:trade_date, :strategy, :trigger_type, :trigger_score,
+                 :top_n, :lookback_period, :selected_json, :signal_json, :created_at)
+        """)
+
+        td = record.get("trade_date")
+        if td and not isinstance(td, date):
+            td = pd.to_datetime(td).date()
+
+        selected = record.get("selected_json") or record.get("selected", [])
+        signal = record.get("signal_json") or record.get("signal", {})
+
+        with self.engine.begin() as conn:
+            conn.execute(sql, {
+                "trade_date": td,
+                "strategy": record.get("strategy", "daily_snapshot"),
+                "trigger_type": record.get("trigger_type", "daily_snapshot"),
+                "trigger_score": record.get("trigger_score"),
+                "top_n": record.get("top_n"),
+                "lookback_period": record.get("lookback_period"),
+                "selected_json": json.dumps(selected, ensure_ascii=False, default=str)
+                    if not isinstance(selected, str) else selected,
+                "signal_json": json.dumps(signal, ensure_ascii=False, default=str)
+                    if not isinstance(signal, str) else signal,
+                "created_at": datetime.now(),
+            })
+
+        logger.info(f"[DB] 保存调仓记录 strategy={record.get('strategy')} date={td}")
+
+    def get_latest_factors(self, top_n: int = None,
+                           trade_date: str = None) -> List[dict]:
+        """
+        查询最新（或指定日期）全池因子快照，按 pool_rank 排序。
+
+        Args:
+            top_n: 若指定，只返回 pool_rank <= top_n 的标的（入选标的）。
+            trade_date: 若指定，查询该日期；否则查询最新日期。
+        Returns:
+            list of dict。
+        """
+        with self.engine.connect() as conn:
+            if trade_date:
+                td = pd.to_datetime(trade_date).date()
+            else:
+                row = conn.execute(
+                    text("SELECT MAX(trade_date) FROM daily_factors")
+                ).fetchone()
+                td = row[0] if row and row[0] else None
+                if not td:
+                    return []
+
+            q = "SELECT * FROM daily_factors WHERE trade_date = :td"
+            params: dict = {"td": td}
+            if top_n:
+                q += " AND is_selected = 1"
+            q += " ORDER BY pool_rank"
+
+            rows = conn.execute(text(q), params).mappings().all()
+            result = [dict(r) for r in rows]
+
+        if top_n:
+            result = result[:top_n]
+        return result
+
+    def get_factor_history(self, symbol: str, days: int = 30) -> pd.DataFrame:
+        """查询某标的近 N 天因子历史"""
+        sql = text("""
+            SELECT trade_date, symbol, name, close, momentum, volatility, r2,
+                   efficiency, pool_rank, is_selected
+            FROM daily_factors
+            WHERE symbol = :symbol
+            ORDER BY trade_date DESC
+            LIMIT :days
+        """)
+        with self.engine.connect() as conn:
+            df = pd.read_sql(sql, conn, params={"symbol": symbol, "days": days})
+        return df.sort_values("trade_date") if not df.empty else df
+
+    def get_latest_discovery(self, scan_date: str = None) -> List[dict]:
+        """查询最新（或指定日期）发现扫描结果，按 scan_rank 排序"""
+        with self.engine.connect() as conn:
+            if scan_date:
+                sd = pd.to_datetime(scan_date).date()
+            else:
+                row = conn.execute(
+                    text("SELECT MAX(scan_date) FROM discovery_scan")
+                ).fetchone()
+                sd = row[0] if row and row[0] else None
+                if not sd:
+                    return []
+
+            rows = conn.execute(
+                text("SELECT * FROM discovery_scan WHERE scan_date = :sd ORDER BY scan_rank"),
+                {"sd": sd},
+            ).mappings().all()
+            return [dict(r) for r in rows]
+
+    def get_rebalance_log(self, days: int = 30,
+                          strategy: str = None) -> List[dict]:
+        """查询近 N 天调仓记录"""
+        sql_parts = ["SELECT * FROM rebalance_log WHERE 1=1"]
+        params: dict = {}
+        if strategy:
+            sql_parts.append("AND strategy = :strategy")
+            params["strategy"] = strategy
+        sql_parts.append("ORDER BY trade_date DESC LIMIT :days")
+        params["days"] = days
+
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                text(" ".join(sql_parts)), params
+            ).mappings().all()
+        return [dict(r) for r in rows]
+
+    # ──────────────────────────────────────────────────────────
+    # 选股择时数据持久化
+    # ──────────────────────────────────────────────────────────
+
+    def save_factor_snapshot(self, records: List[dict]) -> int:
+        """
+        批量写入每日因子快照（INSERT OR REPLACE，幂等）。
+
+        records 每条须含: trade_date, symbol, name, close,
+            momentum, volatility, r2, efficiency,
+            pool_rank, is_selected, top_n, lookback_period
+        可选: accel, composite, drawdown_from_high
+        """
+        if not records:
+            return 0
+
+        sql = text("""
+            INSERT OR REPLACE INTO daily_factors
+                (trade_date, symbol, name, close,
+                 momentum, volatility, r2, efficiency,
+                 accel, composite, drawdown_from_high,
+                 pool_rank, is_selected, top_n, lookback_period, created_at)
+            VALUES
+                (:trade_date, :symbol, :name, :close,
+                 :momentum, :volatility, :r2, :efficiency,
+                 :accel, :composite, :drawdown_from_high,
+                 :pool_rank, :is_selected, :top_n, :lookback_period, :created_at)
+        """)
+
+        rows = []
+        now = datetime.now()
+        for r in records:
+            rows.append({
+                "trade_date": pd.to_datetime(r["trade_date"]).date(),
+                "symbol": r["symbol"],
+                "name": r.get("name", ""),
+                "close": r.get("close"),
+                "momentum": r.get("momentum"),
+                "volatility": r.get("volatility"),
+                "r2": r.get("r2"),
+                "efficiency": r.get("efficiency"),
+                "accel": r.get("accel"),
+                "composite": r.get("composite"),
+                "drawdown_from_high": r.get("drawdown_from_high"),
+                "pool_rank": r.get("pool_rank"),
+                "is_selected": int(bool(r.get("is_selected", False))),
+                "top_n": r.get("top_n"),
+                "lookback_period": r.get("lookback_period"),
+                "created_at": now,
+            })
+
+        with self.engine.begin() as conn:
+            conn.execute(sql, rows)
+        logger.info(f"[DB] 写入 {len(rows)} 条因子快照 (trade_date={rows[0]['trade_date']})")
+        return len(rows)
+
+    def save_discovery_scan(self, records: List[dict], scan_date: str,
+                            is_stale_cache: bool = False) -> int:
+        """
+        批量写入全市场发现扫描结果（INSERT OR REPLACE，幂等）。
+
+        records 为 StockDiscovery.discover() 的返回值列表，
+        每条须含: symbol, name, asset_type, latest_price, circ_mv,
+            amount, turnover_rate, momentum, volatility, r2, efficiency
+        """
+        if not records:
+            return 0
+
+        sql = text("""
+            INSERT OR REPLACE INTO discovery_scan
+                (scan_date, symbol, name, asset_type,
+                 latest_price, circ_mv, amount, turnover_rate,
+                 momentum, volatility, r2, efficiency,
+                 scan_rank, is_stale_cache, created_at)
+            VALUES
+                (:scan_date, :symbol, :name, :asset_type,
+                 :latest_price, :circ_mv, :amount, :turnover_rate,
+                 :momentum, :volatility, :r2, :efficiency,
+                 :scan_rank, :is_stale_cache, :created_at)
+        """)
+
+        date_val = pd.to_datetime(scan_date).date()
+        now = datetime.now()
+        rows = []
+        for rank, r in enumerate(records, 1):
+            rows.append({
+                "scan_date": date_val,
+                "symbol": r.get("symbol", ""),
+                "name": r.get("name", ""),
+                "asset_type": r.get("asset_type", ""),
+                "latest_price": r.get("latest_price"),
+                "circ_mv": r.get("circ_mv"),
+                "amount": r.get("amount"),
+                "turnover_rate": r.get("turnover_rate"),
+                "momentum": r.get("momentum"),
+                "volatility": r.get("volatility"),
+                "r2": r.get("r2"),
+                "efficiency": r.get("efficiency"),
+                "scan_rank": rank,
+                "is_stale_cache": int(is_stale_cache),
+                "created_at": now,
+            })
+
+        with self.engine.begin() as conn:
+            conn.execute(sql, rows)
+        logger.info(f"[DB] 写入 {len(rows)} 条发现扫描结果 (scan_date={date_val})")
+        return len(rows)
+
+    def save_rebalance_log(self, record: dict) -> None:
+        """
+        写入一条调仓记录（INSERT OR REPLACE，幂等）。
+
+        record 须含: trade_date, strategy, top_n, lookback_period, selected_json
+        可选: trigger_type, trigger_score, signal_json
+        """
+        sql = text("""
+            INSERT OR REPLACE INTO rebalance_log
+                (trade_date, strategy, trigger_type, trigger_score,
+                 top_n, lookback_period, selected_json, signal_json, created_at)
+            VALUES
+                (:trade_date, :strategy, :trigger_type, :trigger_score,
+                 :top_n, :lookback_period, :selected_json, :signal_json, :created_at)
+        """)
+        with self.engine.begin() as conn:
+            conn.execute(sql, {
+                "trade_date": pd.to_datetime(record["trade_date"]).date(),
+                "strategy": record["strategy"],
+                "trigger_type": record.get("trigger_type", "daily_snapshot"),
+                "trigger_score": record.get("trigger_score"),
+                "top_n": record.get("top_n"),
+                "lookback_period": record.get("lookback_period"),
+                "selected_json": json.dumps(
+                    record.get("selected", []), ensure_ascii=False, default=str
+                ),
+                "signal_json": json.dumps(
+                    record.get("signal_details", {}), ensure_ascii=False, default=str
+                ),
+                "created_at": datetime.now(),
+            })
+        logger.info(f"[DB] 写入调仓记录 date={record['trade_date']} strategy={record['strategy']}")
+
+    def get_latest_factors(self, top_n: int = None,
+                           trade_date: str = None) -> List[dict]:
+        """
+        查询最新一天（或指定日期）的因子快照。
+
+        Args:
+            top_n:       若指定，只返回 is_selected=1 的前 top_n 条
+            trade_date:  YYYYMMDD 或 YYYY-MM-DD；默认取库内最新日期
+
+        Returns:
+            list of dict，按 pool_rank 升序排列
+        """
+        with self.engine.connect() as conn:
+            if trade_date is None:
+                row = conn.execute(
+                    text("SELECT MAX(trade_date) FROM daily_factors")
+                ).fetchone()
+                if not row or row[0] is None:
+                    return []
+                trade_date = row[0]
+            else:
+                trade_date = pd.to_datetime(trade_date).date()
+
+            where = "WHERE trade_date = :d"
+            if top_n is not None:
+                where += " AND is_selected = 1"
+            sql = text(
+                f"SELECT * FROM daily_factors {where} ORDER BY pool_rank ASC"
+            )
+            rows = conn.execute(sql, {"d": trade_date}).mappings().fetchall()
+            return [dict(r) for r in rows]
+
+    def get_factor_history(self, symbol: str, days: int = 30) -> pd.DataFrame:
+        """查询某标的最近 N 天的因子历史，用于趋势分析"""
+        session = self.Session()
+        try:
+            q = (session.query(DailyFactors)
+                 .filter(DailyFactors.symbol == symbol)
+                 .order_by(DailyFactors.trade_date.desc())
+                 .limit(days))
+            df = pd.read_sql(q.statement, session.bind)
+            if not df.empty:
+                df["trade_date"] = pd.to_datetime(df["trade_date"])
+                df.sort_values("trade_date", inplace=True)
+            return df
+        finally:
+            session.close()
+
+    def get_latest_discovery(self, scan_date: str = None) -> List[dict]:
+        """
+        查询最新一次（或指定日期）的发现扫描结果。
+
+        Returns:
+            list of dict，按 scan_rank 升序排列
+        """
+        with self.engine.connect() as conn:
+            if scan_date is None:
+                row = conn.execute(
+                    text("SELECT MAX(scan_date) FROM discovery_scan")
+                ).fetchone()
+                if not row or row[0] is None:
+                    return []
+                scan_date = row[0]
+            else:
+                scan_date = pd.to_datetime(scan_date).date()
+
+            rows = conn.execute(
+                text("SELECT * FROM discovery_scan WHERE scan_date = :d ORDER BY scan_rank ASC"),
+                {"d": scan_date},
+            ).mappings().fetchall()
+            return [dict(r) for r in rows]
+
+    def get_rebalance_log(self, days: int = 30,
+                          strategy: str = None) -> List[dict]:
+        """查询最近 N 天的调仓记录"""
+        cutoff = (datetime.now() - timedelta(days=days)).date()
+        with self.engine.connect() as conn:
+            if strategy:
+                rows = conn.execute(
+                    text("""SELECT * FROM rebalance_log
+                            WHERE trade_date >= :c AND strategy = :s
+                            ORDER BY trade_date DESC"""),
+                    {"c": cutoff, "s": strategy},
+                ).mappings().fetchall()
+            else:
+                rows = conn.execute(
+                    text("""SELECT * FROM rebalance_log
+                            WHERE trade_date >= :c
+                            ORDER BY trade_date DESC"""),
+                    {"c": cutoff},
+                ).mappings().fetchall()
+            result = []
+            for r in rows:
+                d = dict(r)
+                d["selected"] = json.loads(d.get("selected_json") or "[]")
+                d["signal_details"] = json.loads(d.get("signal_json") or "{}")
+                result.append(d)
+            return result
 
     # ──────────────────────────────────────────────────────────
     # 兼容旧接口

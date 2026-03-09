@@ -36,6 +36,7 @@ from breadfree.strategies.agent_strategy_v2 import AgentStrategyV2
 from breadfree.strategies.effi_agent_strategy import EffiAgentRotationStrategy
 from breadfree.strategies.dynamic_rotation_strategy import DynamicRotationStrategy
 from breadfree.data.stock_discovery import StockDiscovery
+from breadfree.data.snapshot import DailySnapshotWriter, _compute_all_factors
 
 logger = get_logger(__name__)
 
@@ -153,7 +154,17 @@ def _fetch_latest_prices(symbols: list, lookback_days: int = 60, end_date: str =
     return price_map
 
 
-def calc_top_n_scores(top_n: int = 5, lookback: int = 20, end_date: str = None) -> list:
+def calc_all_factor_scores(lookback: int = 20, end_date: str = None,
+                           top_n: int = 5) -> list:
+    """
+    计算固定池全部标的的因子分，返回按效率分降序的完整列表。
+
+    每条记录包含: symbol, name, trade_date, close,
+        momentum, volatility, r2, efficiency,
+        pool_rank, is_selected (是否入选 top_n)
+
+    与 calc_top_n_scores 的区别: 返回全部 25 条，不截断。
+    """
     pool = _get_etf_pool()
     symbols = list(pool.keys())
     price_map = _fetch_latest_prices(symbols, lookback_days=lookback * 3, end_date=end_date)
@@ -168,13 +179,25 @@ def calc_top_n_scores(top_n: int = 5, lookback: int = 20, end_date: str = None) 
             continue
         metrics["symbol"] = symbol
         metrics["name"] = pool.get(symbol, symbol)
+        metrics["trade_date"] = end_date or _report_end_date()
         scored.append(metrics)
 
     scored.sort(key=lambda x: x["efficiency"], reverse=True)
-    for i, item in enumerate(scored[:top_n], 1):
-        item["rank"] = i
+    selected_symbols = {s["symbol"] for s in scored[:top_n]}
+    for rank, item in enumerate(scored, 1):
+        item["pool_rank"] = rank
+        item["is_selected"] = item["symbol"] in selected_symbols
 
-    return scored[:top_n]
+    return scored
+
+
+def calc_top_n_scores(top_n: int = 5, lookback: int = 20, end_date: str = None) -> list:
+    """返回效率分 Top-N（向后兼容接口，内部调用 calc_all_factor_scores）"""
+    all_scores = calc_all_factor_scores(lookback=lookback, end_date=end_date, top_n=top_n)
+    top = [s for s in all_scores if s.get("is_selected")]
+    for i, item in enumerate(top, 1):
+        item["rank"] = i
+    return top
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -839,30 +862,47 @@ def generate_and_send_report():
     logger.info("[Report] 刷新池内行情至最近交易日...")
     _refresh_pool_data_for_report(symbols, report_end, lookback_days=90)
 
-    # 1) Top-N 因子排名
-    logger.info(f"[Report] 计算 Top-{top_n} 因子得分...")
-    top_scores = calc_top_n_scores(top_n=top_n, lookback=lookback, end_date=report_end)
-    if not top_scores:
+    # 1) 全池因子排名（计算全部 25 标的，含排名和选股标志）
+    logger.info(f"[Report] 计算全池因子得分 (Top-{top_n})...")
+    all_scores = calc_all_factor_scores(lookback=lookback, end_date=report_end, top_n=top_n)
+    if not all_scores:
         logger.warning("[Report] 无有效标的得分, 跳过发送")
         return False
+    top_scores = [s for s in all_scores if s.get("is_selected")]
+    for i, s in enumerate(top_scores, 1):
+        s["rank"] = i
     logger.info(f"[Report] Top-{top_n}: {[s['symbol'] + '-' + s['name'] for s in top_scores]}")
 
     # 2) 全市场主动发现扫描（获取扩展池，供 DynamicRotation 使用）
     logger.info("[Report] 执行全市场主动发现扫描...")
     expanded_pool = None
+    disc_cfg = get_config().get("discovery", {})
     try:
         discovery = StockDiscovery(
-            min_amount=5e7,
-            min_circ_mv=5e9,
-            efficiency_threshold=0.5,
+            min_amount=float(disc_cfg.get("min_amount", 5e7)),
+            min_circ_mv=float(disc_cfg.get("min_circ_mv", 5e9)),
+            efficiency_threshold=float(disc_cfg.get("efficiency_threshold", 0.5)),
             lookback_period=lookback,
-            max_discover=30,
+            max_discover=int(disc_cfg.get("max_discover", 30)),
         )
         expanded_pool = discovery.get_expanded_pool(end_date=report_end, max_expand=10)
         discovery_summary = discovery.get_discovery_summary(report_end)
     except Exception as e:
         logger.warning(f"[Report] 主动发现扫描异常: {e}")
         discovery_summary = {"total_discovered": 0, "top_discoveries": []}
+
+    # 2a) 持久化选股择时快照（因子 + 发现 + 调仓记录 + JSON 导出）
+    try:
+        snapshot_writer = DailySnapshotWriter()
+        snapshot_writer.write(
+            trade_date=report_end,
+            all_scores=all_scores,
+            top_n=top_n,
+            lookback=lookback,
+            discovery_summary=discovery_summary,
+        )
+    except Exception as e:
+        logger.warning(f"[Report] 快照持久化异常（不影响邮件发送）: {e}")
 
     # 入池汇总：固定池 Top-N + 发现池新入（不在固定池的 discovery 标的）
     pool_entries = {

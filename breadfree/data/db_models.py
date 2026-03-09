@@ -12,10 +12,17 @@
     stock_sector_mapping 标的-板块映射
     sentiment_data       情感分析 (预留)
 
+    ── 选股择时数据 ──
+    daily_factors        每日全池因子快照 (效率分/动量/R²等)
+    discovery_scan       全市场主动发现扫描结果
+    rebalance_log        调仓/择时决策记录
+
 索引策略 (参考高频量化):
     daily_data: 覆盖索引 (symbol, trade_date) 含 OHLCV → 回测扫描零随机IO
     news_articles: (symbol, publish_date) → 按日期范围查新闻
     market_intel_daily: (intel_type, date) → 按类型+日期查情报
+    daily_factors: (trade_date, pool_rank) → 按日期+排名快速查最新选股
+    discovery_scan: (scan_date, scan_rank) → 按日期+排名查发现结果
 """
 
 from datetime import datetime
@@ -204,3 +211,120 @@ class SentimentData(Base):
     keywords = Column(Text)
     source = Column(String(50))
     created_at = Column(DateTime, default=datetime.now)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 选股择时数据表
+# ═══════════════════════════════════════════════════════════════
+
+class DailyFactors(Base):
+    """
+    每日全池因子快照 — 选股核心数据
+
+    每次每日报告（或独立快照脚本）运行时，为固定池内所有标的写入一行。
+    可供下游脚本/cron 直接查询最新排名、因子趋势、选股信号。
+    """
+    __tablename__ = "daily_factors"
+
+    id = Column(Integer, primary_key=True)
+    trade_date = Column(Date, nullable=False)
+    symbol = Column(String(10), nullable=False)
+    name = Column(String(50))
+
+    # 收盘价
+    close = Column(Float)
+
+    # 核心因子（与 metrics.py calculate_efficiency_metrics 一致）
+    momentum = Column(Float)      # 区间 ROC（20日）
+    volatility = Column(Float)    # 日波动率（日收益标准差）
+    r2 = Column(Float)            # 线性趋势 R²
+    efficiency = Column(Float)    # 效率分 = (momentum / period_vol) * R²
+
+    # 扩展因子（若计算了 accel/composite 时填入，否则 NULL）
+    accel = Column(Float)                # 动量加速度
+    composite = Column(Float)            # 多因子综合分
+    drawdown_from_high = Column(Float)   # 离近期高点回撤
+
+    # 排名与选股标志
+    pool_rank = Column(Integer)    # 在池内排名（1=效率分最高）
+    is_selected = Column(Integer)  # 是否入选 Top-N（1=是，0=否）
+    top_n = Column(Integer)        # 本次 top_n 配置
+    lookback_period = Column(Integer)
+
+    created_at = Column(DateTime, default=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint("trade_date", "symbol", name="uq_factors_date_symbol"),
+        Index("ix_factors_date_rank", "trade_date", "pool_rank"),
+    )
+
+
+class DiscoveryScan(Base):
+    """
+    全市场主动发现扫描结果 — 扩展选股数据
+
+    每次 StockDiscovery.discover() 完成后写入。
+    记录不在固定池内、但通过流动性+效率筛选的标的。
+    """
+    __tablename__ = "discovery_scan"
+
+    id = Column(Integer, primary_key=True)
+    scan_date = Column(Date, nullable=False)
+    symbol = Column(String(10), nullable=False)
+    name = Column(String(50))
+    asset_type = Column(String(10))    # 'etf' or 'stock'
+
+    # 实时行情字段（来自东方财富 API）
+    latest_price = Column(Float)
+    circ_mv = Column(Float)            # 流通市值（元）
+    amount = Column(Float)             # 日成交额（元）
+    turnover_rate = Column(Float)      # 换手率（%）
+
+    # 效率因子
+    momentum = Column(Float)
+    volatility = Column(Float)
+    r2 = Column(Float)
+    efficiency = Column(Float)
+
+    scan_rank = Column(Integer)        # 在本次扫描结果中的排名（1=最优）
+    is_stale_cache = Column(Integer)   # 数据是否来自过期缓存（1=是）
+
+    created_at = Column(DateTime, default=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint("scan_date", "symbol", name="uq_scan_date_symbol"),
+        Index("ix_scan_date_rank", "scan_date", "scan_rank"),
+    )
+
+
+class RebalanceLog(Base):
+    """
+    调仓/择时决策记录 — 择时核心数据
+
+    每次策略触发调仓时写入一行，记录：调仓日期、触发原因、选出的标的及权重。
+    供下游消费最新持仓建议，或审计历史调仓决策。
+    """
+    __tablename__ = "rebalance_log"
+
+    id = Column(Integer, primary_key=True)
+    trade_date = Column(Date, nullable=False)
+    strategy = Column(String(50), nullable=False)   # RotationStrategy / DynamicRotation / daily_report
+
+    # 触发信息
+    trigger_type = Column(String(50))     # periodic / trailing_stop / momentum_breakout / daily_snapshot
+    trigger_score = Column(Float)         # 综合触发分（DynamicRotation 专用）
+
+    # 配置
+    top_n = Column(Integer)
+    lookback_period = Column(Integer)
+
+    # 选股结果（JSON 序列化）
+    selected_json = Column(Text)   # [{symbol, name, rank, efficiency, weight}, ...]
+    signal_json = Column(Text)     # 额外信号详情（DynamicRotation 专用）
+
+    created_at = Column(DateTime, default=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint("trade_date", "strategy", name="uq_rebalance_date_strategy"),
+        Index("ix_rebalance_date", "trade_date"),
+    )
