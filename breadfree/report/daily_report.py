@@ -584,12 +584,40 @@ def _build_strategy_section(result: dict, cid: str, section_num: int) -> str:
 def _build_discovery_section(discovery_summary: dict) -> str:
     """构建全市场主动发现模块的 HTML"""
     discoveries = discovery_summary.get("top_discoveries", [])
+    status = discovery_summary.get("status", "")
+    message = discovery_summary.get("message", "")
+    total_market = discovery_summary.get("total_market", 0)
+    total_after_liquidity = discovery_summary.get("total_after_liquidity", 0)
+    total_after_excluding_fixed_pool = discovery_summary.get("total_after_excluding_fixed_pool", 0)
+    used_cache = discovery_summary.get("used_cache", False)
+    scan_time = discovery_summary.get("scan_time", "")
+
+    empty_desc_map = {
+        "market_data_unavailable": "本次扫描未拉取到全市场行情，可能是数据源异常或网络暂不可用。",
+        "no_liquidity_candidates": "行情拉取成功，但没有标的通过流动性筛选条件。",
+        "all_candidates_in_fixed_pool": "扫描完成，但候选标的均已在固定池中，本次无新增标的。",
+        "no_high_efficiency_candidates": "扫描完成，但没有标的达到效率分阈值。",
+        "scan_exception": "主动发现扫描发生异常，本次未输出新标的。",
+        "cache_hit_memory": "本次使用内存缓存结果，未新增可展示标的。",
+        "cache_hit_file": "本次使用文件缓存结果，未新增可展示标的。",
+    }
     if not discoveries:
+        desc = empty_desc_map.get(status, "本次扫描未发现符合条件的新标的。")
+        if message and status not in {"scan_exception"}:
+            desc = f"{desc}（{message}）"
+        meta_line = (
+            f"扫描统计：全市场 {total_market} → 流动性筛选 {total_after_liquidity} → 排除固定池后 {total_after_excluding_fixed_pool}"
+            if total_market or total_after_liquidity or total_after_excluding_fixed_pool
+            else "扫描统计：暂无有效样本"
+        )
+        cache_note = "（缓存结果）" if used_cache else ""
         return """
         <div style="margin-top:16px; padding:12px; background:#f9f9f9; border-radius:6px;">
             <h3 style="margin:0 0 8px 0;">🔍 全市场主动发现</h3>
-            <p style="font-size:13px; color:#888;">本次扫描未发现符合条件的新标的 (或网络不可用)</p>
-        </div>"""
+            <p style="font-size:13px; color:#666;">{desc}</p>
+            <p style="font-size:11px; color:#999; margin:4px 0 0 0;">{meta_line}</p>
+            <p style="font-size:11px; color:#aaa; margin:4px 0 0 0;">扫描时间: {scan_time}{cache_note}</p>
+        </div>""".format(desc=desc, meta_line=meta_line, scan_time=scan_time, cache_note=cache_note)
 
     rows = ""
     for i, d in enumerate(discoveries[:10], 1):
@@ -612,6 +640,7 @@ def _build_discovery_section(discovery_summary: dict) -> str:
     avg_eff = discovery_summary.get("avg_efficiency", 0)
     max_eff = discovery_summary.get("max_efficiency", 0)
 
+    scan_note = f"扫描时间: {scan_time}{'（缓存结果）' if used_cache else ''}" if scan_time else ""
     return f"""
     <div style="margin-top:16px; padding:12px; background:#fffbe6; border:1px solid #ffe58f; border-radius:6px;">
         <h3 style="margin:0 0 8px 0;">🔍 全市场主动发现 <span style="font-size:12px;color:#888;font-weight:normal;">
@@ -620,6 +649,7 @@ def _build_discovery_section(discovery_summary: dict) -> str:
             从全 A 股/ETF 市场扫描, 筛选流动性充足 (日成交额&gt;5000万, 流通市值&gt;50亿) 且效率分&gt;0.5 的标的.
             标有 ★ 的标的为新发现, 不在固定池内.
         </p>
+        <p style="font-size:11px; color:#999; margin:0 0 8px 0;">{scan_note}</p>
         <table style="border-collapse:collapse; width:100%; font-size:12px;" border="1" cellpadding="5">
         <thead style="background:#f5f5f5;">
         <tr><th>排名</th><th>代码</th><th>名称</th><th>最新价</th>
@@ -852,7 +882,18 @@ def generate_and_send_report():
         discovery_summary = discovery.get_discovery_summary(report_end)
     except Exception as e:
         logger.warning(f"[Report] 主动发现扫描异常: {e}")
-        discovery_summary = {"total_discovered": 0, "top_discoveries": []}
+        discovery_summary = {
+            "status": "scan_exception",
+            "message": str(e),
+            "total_market": 0,
+            "total_after_liquidity": 0,
+            "total_after_excluding_fixed_pool": 0,
+            "total_discovered": 0,
+            "top_discoveries": [],
+            "avg_efficiency": 0,
+            "max_efficiency": 0,
+            "scan_time": datetime.now(TZ_SHANGHAI).strftime("%Y-%m-%d %H:%M"),
+        }
 
     # 入池汇总：固定池 Top-N + 发现池新入（不在固定池的 discovery 标的）
     pool_entries = {

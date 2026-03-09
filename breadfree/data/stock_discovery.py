@@ -179,6 +179,30 @@ class StockDiscovery:
 
         self._last_scan: Optional[pd.DataFrame] = None
         self._last_scan_time: Optional[datetime] = None
+        self._last_scan_meta: Dict[str, object] = {
+            "status": "not_run",
+            "message": "尚未执行扫描",
+            "used_cache": False,
+            "total_market": 0,
+            "total_after_liquidity": 0,
+            "total_after_excluding_fixed_pool": 0,
+            "total_discovered": 0,
+            "scan_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+
+    def _update_scan_meta(self, **kwargs):
+        meta = {
+            "status": "unknown",
+            "message": "",
+            "used_cache": False,
+            "total_market": 0,
+            "total_after_liquidity": 0,
+            "total_after_excluding_fixed_pool": 0,
+            "total_discovered": 0,
+            "scan_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+        meta.update(kwargs)
+        self._last_scan_meta = meta
 
     def _is_cache_valid(self) -> bool:
         if self._last_scan is None or self._last_scan_time is None:
@@ -343,13 +367,26 @@ class StockDiscovery:
             list of dict, 每个 dict 包含 symbol, name, efficiency, momentum 等
         """
         if self._is_cache_valid():
-            return self._last_scan.to_dict("records") if not self._last_scan.empty else []
+            cached_records = self._last_scan.to_dict("records") if not self._last_scan.empty else []
+            self._update_scan_meta(
+                status="cache_hit_memory",
+                message="使用内存缓存结果",
+                used_cache=True,
+                total_discovered=len(cached_records),
+            )
+            return cached_records
 
         file_cache = self._load_file_cache()
         if file_cache is not None and not file_cache.empty:
             self._last_scan = file_cache
             self._last_scan_time = datetime.now()
             logger.info(f"[Discovery] 从文件缓存加载 {len(file_cache)} 条扫描结果")
+            self._update_scan_meta(
+                status="cache_hit_file",
+                message="使用文件缓存结果",
+                used_cache=True,
+                total_discovered=len(file_cache),
+            )
             return file_cache.to_dict("records")
 
         if end_date is None:
@@ -360,17 +397,39 @@ class StockDiscovery:
         market_data = self._fetch_market_data()
         if market_data.empty:
             logger.warning("[Discovery] 无法获取市场数据, 返回空结果")
+            self._update_scan_meta(
+                status="market_data_unavailable",
+                message="未获取到全市场行情数据",
+            )
             return []
+        total_market = len(market_data)
 
         filtered = self._apply_liquidity_filter(market_data)
         if filtered.empty:
             logger.warning("[Discovery] 流动性过滤后无候选标的")
+            self._update_scan_meta(
+                status="no_liquidity_candidates",
+                message="无标的通过流动性筛选",
+                total_market=total_market,
+                total_after_liquidity=0,
+            )
             return []
+        total_after_liquidity = len(filtered)
 
         cfg = get_config()
         fixed_pool = set(cfg.get("etf_pool", {}).keys())
         filtered = filtered[~filtered["symbol"].isin(fixed_pool)]
         logger.info(f"[Discovery] 排除固定池后剩余 {len(filtered)} 个候选")
+        total_after_excluding_fixed_pool = len(filtered)
+        if filtered.empty:
+            self._update_scan_meta(
+                status="all_candidates_in_fixed_pool",
+                message="候选标的均已在固定池中",
+                total_market=total_market,
+                total_after_liquidity=total_after_liquidity,
+                total_after_excluding_fixed_pool=0,
+            )
+            return []
 
         scored = self._calc_efficiency_scores(filtered, end_date)
         logger.info(f"[Discovery] 效率分筛选后 {len(scored)} 个标的")
@@ -380,6 +439,23 @@ class StockDiscovery:
             self._last_scan = result_df
             self._last_scan_time = datetime.now()
             self._save_file_cache(result_df)
+            self._update_scan_meta(
+                status="success",
+                message="扫描完成",
+                total_market=total_market,
+                total_after_liquidity=total_after_liquidity,
+                total_after_excluding_fixed_pool=total_after_excluding_fixed_pool,
+                total_discovered=len(scored),
+            )
+        else:
+            self._update_scan_meta(
+                status="no_high_efficiency_candidates",
+                message="无标的达到效率分阈值",
+                total_market=total_market,
+                total_after_liquidity=total_after_liquidity,
+                total_after_excluding_fixed_pool=total_after_excluding_fixed_pool,
+                total_discovered=0,
+            )
 
         return scored
 
@@ -416,23 +492,45 @@ class StockDiscovery:
 
     def get_discovery_summary(self, end_date: str = None) -> dict:
         """生成发现摘要, 用于邮件报告"""
-        discovered = self.discover(end_date)
+        try:
+            discovered = self.discover(end_date)
+        except Exception as e:
+            logger.warning(f"[Discovery] 生成发现摘要失败: {e}")
+            self._update_scan_meta(
+                status="scan_exception",
+                message=f"扫描异常: {e}",
+            )
+            discovered = []
+        meta = dict(self._last_scan_meta)
 
         if not discovered:
             return {
-                "total_scanned": 0,
+                "status": meta.get("status", "unknown"),
+                "message": meta.get("message", ""),
+                "used_cache": bool(meta.get("used_cache", False)),
+                "total_market": int(meta.get("total_market", 0)),
+                "total_after_liquidity": int(meta.get("total_after_liquidity", 0)),
+                "total_after_excluding_fixed_pool": int(meta.get("total_after_excluding_fixed_pool", 0)),
+                "total_scanned": int(meta.get("total_after_excluding_fixed_pool", 0)),
                 "total_discovered": 0,
                 "top_discoveries": [],
                 "avg_efficiency": 0,
-                "scan_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "max_efficiency": 0,
+                "scan_time": meta.get("scan_time") or datetime.now().strftime("%Y-%m-%d %H:%M"),
             }
 
         efficiencies = [d["efficiency"] for d in discovered]
         return {
-            "total_scanned": len(discovered),
+            "status": meta.get("status", "success"),
+            "message": meta.get("message", "扫描完成"),
+            "used_cache": bool(meta.get("used_cache", False)),
+            "total_market": int(meta.get("total_market", len(discovered))),
+            "total_after_liquidity": int(meta.get("total_after_liquidity", len(discovered))),
+            "total_after_excluding_fixed_pool": int(meta.get("total_after_excluding_fixed_pool", len(discovered))),
+            "total_scanned": int(meta.get("total_after_excluding_fixed_pool", len(discovered))),
             "total_discovered": len(discovered),
             "top_discoveries": discovered[:10],
             "avg_efficiency": float(np.mean(efficiencies)),
             "max_efficiency": float(max(efficiencies)),
-            "scan_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "scan_time": meta.get("scan_time") or datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
